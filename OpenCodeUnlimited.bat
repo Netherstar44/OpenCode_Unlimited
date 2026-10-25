@@ -259,6 +259,316 @@ function Get-UserAntiCollisionPool {
 }
 
 # =============================================================================
+# TOR SUBSYSTEM - Rotacion anonima de IP via red Tor (miles de nodos de salida)
+# Funciona sin instalar nada: descarga Tor Expert Bundle portable automaticamente.
+# =============================================================================
+
+$global:TorDir       = Join-Path $env:TEMP "opencode_tor"
+$global:TorExe       = Join-Path $global:TorDir "Tor\tor.exe"
+$global:TorDataDir   = Join-Path $global:TorDir "Data\Tor"
+$global:TorSocksPort = 9150   # Puerto SOCKS5 de Tor
+$global:TorCtrlPort  = 9151   # Puerto de control Tor (NEWNYM)
+$global:TorHttpPort  = 8119   # Puerto del bridge HTTP→SOCKS5 (para OpenCode)
+$global:TorProcess   = $null
+
+function Get-TorBundlePath {
+    # Descarga Tor Expert Bundle portable si no existe (sin instalacion)
+    if (Test-Path $global:TorExe) { return $true }
+    Write-EngineLog "Tor no encontrado. Descargando Tor Expert Bundle portable (~6MB)..." "ACTION"
+    try {
+        $torUrl  = "https://archive.torproject.org/tor-package-archive/torbrowser/14.5.2/tor-expert-bundle-windows-x86_64-14.5.2.tar.gz"
+        $tarGz   = Join-Path $env:TEMP "tor_bundle.tar.gz"
+        New-Item -ItemType Directory -Force -Path $global:TorDir | Out-Null
+        $wc = [System.Net.WebClient]::new()
+        $wc.DownloadFile($torUrl, $tarGz)
+        # Extraer con tar (disponible en Windows 10+)
+        & tar.exe -xzf $tarGz -C $global:TorDir 2>$null | Out-Null
+        Remove-Item $tarGz -Force -ErrorAction SilentlyContinue
+        if (Test-Path $global:TorExe) {
+            Write-EngineLog "Tor Expert Bundle instalado correctamente en $global:TorDir" "SUCCESS"
+            return $true
+        }
+        Write-EngineLog "Fallo la extraccion de Tor. Verifica conexion a internet." "ERROR"
+        return $false
+    } catch {
+        Write-EngineLog "Error descargando Tor: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+function Start-TorDaemon {
+    # Inicia tor.exe como proxy SOCKS5 local con ControlPort habilitado
+    if ($global:TorProcess -and -not $global:TorProcess.HasExited) { return $true }
+    if (-not (Get-TorBundlePath)) { return $false }
+
+    New-Item -ItemType Directory -Force -Path $global:TorDataDir | Out-Null
+    $torConfig = @"
+SocksPort $global:TorSocksPort
+ControlPort $global:TorCtrlPort
+CookieAuthentication 0
+DataDirectory $global:TorDataDir
+Log notice stderr
+ExitPolicy reject *:*
+"@
+    $configPath = Join-Path $global:TorDir "torrc_opencode"
+    $torConfig | Set-Content -Path $configPath -Encoding ASCII -Force
+
+    try {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($global:TorExe)
+        $psi.Arguments        = "-f `"$configPath`""
+        $psi.UseShellExecute  = $false
+        $psi.CreateNoWindow   = $true
+        $psi.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $global:TorProcess = $p
+
+        Write-EngineLog "Tor iniciado (PID $($p.Id)). Esperando bootstrap de red (~15s)..." "ACTION"
+        # Esperar hasta que Tor esté listo (bootstrap 100%)
+        $deadline = (Get-Date).AddSeconds(30)
+        $ready    = $false
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            try {
+                $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $global:TorSocksPort)
+                $tcp.Close()
+                $ready = $true
+                break
+            } catch {}
+        }
+        if ($ready) {
+            Write-EngineLog "Tor listo en SOCKS5 127.0.0.1:$global:TorSocksPort" "SUCCESS"
+            return $true
+        }
+        Write-EngineLog "Tor no respondio a tiempo. Puede estar lento en la red." "WARN"
+        return $false
+    } catch {
+        Write-EngineLog "Error iniciando Tor: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+function Stop-TorDaemon {
+    if ($global:TorProcess -and -not $global:TorProcess.HasExited) {
+        try { $global:TorProcess.Kill() } catch {}
+        $global:TorProcess = $null
+        Write-EngineLog "Daemon Tor detenido." "INFO"
+    }
+    # Tambien limpiar el bridge Python
+    try { & taskkill.exe /F /IM "python.exe" /FI "WINDOWTITLE eq tor_http_bridge" 2>$null | Out-Null } catch {}
+}
+
+function Start-TorHttpBridge {
+    # Lanza un micro-servidor HTTP->SOCKS5 en Python para que OpenCode pueda usar Tor
+    # (OpenCode usa HTTP_PROXY, no SOCKS5 directo)
+    $bridgeScript = @"
+import socket, threading, socks, select, sys
+LISTEN_PORT  = $global:TorHttpPort
+SOCKS5_HOST  = '127.0.0.1'
+SOCKS5_PORT  = $global:TorSocksPort
+
+def forward(src, dst):
+    try:
+        while True:
+            r, _, _ = select.select([src, dst], [], [], 5)
+            if not r: break
+            for s in r:
+                d = dst if s is src else src
+                data = s.recv(4096)
+                if not data: return
+                d.sendall(data)
+    except: pass
+    finally:
+        for s in (src, dst): 
+            try: s.close()
+            except: pass
+
+def handle(conn):
+    try:
+        raw = b''
+        while b'\r\n\r\n' not in raw:
+            chunk = conn.recv(4096)
+            if not chunk: return
+            raw += chunk
+        first = raw.split(b'\r\n')[0].decode()
+        parts = first.split()
+        if len(parts) < 3: return
+        method, target = parts[0], parts[1]
+        if method == 'CONNECT':
+            host, port = target.rsplit(':', 1)
+            port = int(port)
+            remote = socks.socksocket()
+            remote.set_proxy(socks.SOCKS5, SOCKS5_HOST, SOCKS5_PORT)
+            remote.connect((host, port))
+            conn.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            t = threading.Thread(target=forward, args=(conn, remote), daemon=True)
+            t.start()
+            forward(remote, conn)
+        else:
+            from urllib.parse import urlparse
+            parsed = urlparse(target)
+            host = parsed.hostname
+            port = parsed.port or 80
+            remote = socks.socksocket()
+            remote.set_proxy(socks.SOCKS5, SOCKS5_HOST, SOCKS5_PORT)
+            remote.connect((host, port))
+            path = parsed.path or '/'
+            if parsed.query: path += '?' + parsed.query
+            hdrs = raw.split(b'\r\n\r\n', 1)
+            new_req = method.encode() + b' ' + path.encode() + b' HTTP/1.1\r\n'
+            body_start = hdrs[1] if len(hdrs) > 1 else b''
+            lines = hdrs[0].split(b'\r\n')[1:]
+            lines = [l for l in lines if not l.lower().startswith(b'proxy-')]
+            new_req += b'\r\n'.join(lines) + b'\r\n\r\n' + body_start
+            remote.sendall(new_req)
+            forward(conn, remote)
+    except: pass
+    finally:
+        try: conn.close()
+        except: pass
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', LISTEN_PORT))
+srv.listen(64)
+sys.stdout.write('BRIDGE_READY\n'); sys.stdout.flush()
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"@
+    $bridgePath = Join-Path $env:TEMP "tor_http_bridge.py"
+    $bridgeScript | Set-Content -Path $bridgePath -Encoding ASCII -Force
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new("python")
+    $psi.Arguments        = "`"$bridgePath`""
+    $psi.UseShellExecute  = $false
+    $psi.CreateNoWindow   = $true
+    $psi.RedirectStandardOutput = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+
+    # Esperar confirmacion del bridge
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $line = $p.StandardOutput.ReadLine()
+        if ($line -eq "BRIDGE_READY") { break }
+        Start-Sleep -Milliseconds 300
+    }
+    Write-EngineLog "Bridge HTTP->SOCKS5 listo en 127.0.0.1:$global:TorHttpPort" "SUCCESS"
+    return "http://127.0.0.1:$global:TorHttpPort"
+}
+
+function Invoke-TorNewCircuit {
+    # Ordena a Tor que construya un nuevo circuito anonimo (nueva IP de salida)
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $global:TorCtrlPort)
+        $stream = $tcp.GetStream()
+        $writer = [System.IO.StreamWriter]::new($stream)
+        $reader = [System.IO.StreamReader]::new($stream)
+        $writer.WriteLine("AUTHENTICATE")
+        $writer.Flush()
+        Start-Sleep -Milliseconds 200
+        $writer.WriteLine("SIGNAL NEWNYM")
+        $writer.Flush()
+        Start-Sleep -Milliseconds 500
+        $writer.Close(); $reader.Close(); $tcp.Close()
+        Write-EngineLog "Nuevo circuito Tor solicitado (NEWNYM). IP de salida cambiada." "SUCCESS"
+        Start-Sleep -Seconds 2  # Tor necesita ~1-2s para establecer el nuevo circuito
+        return $true
+    } catch {
+        Write-EngineLog "No se pudo rotar circuito Tor: $($_.Exception.Message)" "WARN"
+        return $false
+    }
+}
+
+function Test-QuotaViaTor {
+    # Prueba la cuota de opencode.ai a traves del proxy HTTP->Tor
+    param([string]$HttpProxy = "http://127.0.0.1:$global:TorHttpPort", [int]$TimeoutMs = 6000)
+    return (Test-OpenCodeQuotaAvailable -ProxyUrl $HttpProxy -TimeoutMs $TimeoutMs)
+}
+
+function Get-TorPublicIP {
+    # Consulta la IP de salida actual del circuito Tor
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("https://check.torproject.org/api/ip")
+        $req.Proxy   = [System.Net.WebProxy]::new("http://127.0.0.1:$global:TorHttpPort")
+        $req.Timeout = 8000
+        $res = $req.GetResponse()
+        $body = [System.IO.StreamReader]::new($res.GetResponseStream()).ReadToEnd()
+        $res.Close()
+        $ip = ($body | ConvertFrom-Json).IP
+        return $ip
+    } catch { return "Desconocida" }
+}
+
+function Invoke-TorQuotaRenew {
+    # Workflow completo: inicia Tor, rota circuitos hasta encontrar IP con cuota libre,
+    # configura HTTP_PROXY para OpenCode y dispara el reset
+    Show-Banner
+    Write-Host "  =========================================================================" -ForegroundColor Magenta
+    Write-Host "  MODO TOR - Rotacion Anonima (miles de IPs de salida disponibles)" -ForegroundColor Cyan
+    Write-Host "  =========================================================================" -ForegroundColor Magenta
+    Write-Host ""
+
+    Write-Host "  [1/3] Iniciando daemon Tor local..." -ForegroundColor DarkGray
+    if (-not (Start-TorDaemon)) {
+        Write-Host "  [ERROR] No se pudo iniciar Tor. Verifica internet y vuelve a intentarlo." -ForegroundColor Red
+        Read-Host "  Presiona ENTER para volver al menu"
+        return
+    }
+
+    Write-Host "  [2/3] Iniciando bridge HTTP->SOCKS5 para OpenCode..." -ForegroundColor DarkGray
+    $proxyUrl = Start-TorHttpBridge
+    Write-Host ""
+
+    Write-Host "  [3/3] Buscando circuito Tor con cuota disponible en opencode.ai..." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $maxRotations = 20
+    $foundClean   = $false
+    for ($i = 1; $i -le $maxRotations; $i++) {
+        $torIP = Get-TorPublicIP
+        Write-Host "  Circuito #$i | IP Tor de salida: $torIP" -ForegroundColor Cyan
+        $probe = Test-QuotaViaTor -HttpProxy $proxyUrl
+        if ($probe.Available) {
+            Write-Host "  [CUOTA LIBRE] IP Tor $torIP tiene cuota 100% disponible!" -ForegroundColor Green
+            $foundClean = $true
+            break
+        } elseif ($probe.Reason -eq 'CUOTA_AGOTADA_HOY') {
+            Write-Host "  [AGOTADA] Nodo Tor $torIP ya consumido. Rotando a nuevo circuito..." -ForegroundColor Yellow
+            Invoke-TorNewCircuit | Out-Null
+        } else {
+            Write-Host "  [?] Estado: $($probe.Reason). Rotando de todas formas..." -ForegroundColor DarkYellow
+            Invoke-TorNewCircuit | Out-Null
+        }
+    }
+
+    if ($foundClean) {
+        Write-Host ""
+        Write-Host "  =========================================================================" -ForegroundColor Cyan
+        Write-Host "  IP Tor limpia encontrada. Configurando OpenCode para usar proxy Tor..." -ForegroundColor Green
+        Write-Host "  =========================================================================" -ForegroundColor Cyan
+        Write-Host ""
+        # Configurar proxy para la sesion actual (OpenCode hereda estas variables)
+        $env:HTTP_PROXY  = $proxyUrl
+        $env:HTTPS_PROXY = $proxyUrl
+        $env:ALL_PROXY   = "socks5://127.0.0.1:$global:TorSocksPort"
+        Invoke-FullReset -ForceCleanSession
+        Write-EngineLog "OpenCode iniciado con proxy Tor ($proxyUrl). IP limpia garantizada." "SUCCESS"
+        Write-Host "  IMPORTANTE: Inicia un NUEVO CHAT (Ctrl+N) para usar la cuota virgen." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  El proxy Tor se mantiene activo mientras OpenCode esta abierto." -ForegroundColor DarkGray
+        Write-Host "  Para desactivar Tor, cierra OpenCode y vuelve al menu (opcion 5 Reset)." -ForegroundColor DarkGray
+    } else {
+        Write-Host ""
+        Write-Host "  [AVISO] No se encontro IP Tor limpia tras $maxRotations intentos." -ForegroundColor Yellow
+        Write-Host "  La red Tor tiene cuota agotada en los nodos probados ahora." -ForegroundColor Yellow
+        Write-Host "  Prueba mas tarde o usa la Opcion 2 con VPN manual." -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+    Read-Host "  Presiona ENTER para volver al menu"
+}
+
+# =============================================================================
 # PROCESSES & DAEMON MANAGEMENT
 # =============================================================================
 
@@ -941,15 +1251,16 @@ function Show-InteractiveMenu {
 
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
         Write-Host "  [1]  Monitor Automatico  (ruteo+IP cada 3s, reset automatico 24/7)" -ForegroundColor White
-        Write-Host "  [2]  Renovar Cuota       (detecta nueva IP + valida cuota libre + rota ID)" -ForegroundColor White
-        Write-Host "  [3]  Tokens Ampliados    (archiva session_v2 + limpia inbox a contexto 0)" -ForegroundColor Cyan
-        Write-Host "  [4]  Reseteo Rapido      (sockets, daemons, DNS/ARP/NetBIOS)" -ForegroundColor White
-        Write-Host "  [5]  Limpieza Total      (cache + cookies + Device ID + sesiones)" -ForegroundColor White
-        Write-Host "  [6]  Stats de Tokens     (sesiones activas, tokens, TOP infladoras)" -ForegroundColor Green
-        Write-Host "  [7]  Cambiar a OpenRouter (fix alternativo: 20+ modelos sin limite diario)" -ForegroundColor Yellow
-        Write-Host "  [8]  Salir" -ForegroundColor Gray
+        Write-Host "  [2]  Renovar Cuota       (detecta nueva IP via VPN + valida cuota + rota ID)" -ForegroundColor White
+        Write-Host "  [3]  Renovar via TOR     (auto-rota miles de IPs anonimas hasta encontrar libre)" -ForegroundColor Magenta
+        Write-Host "  [4]  Tokens Ampliados    (archiva session_v2 + limpia inbox a contexto 0)" -ForegroundColor Cyan
+        Write-Host "  [5]  Reseteo Rapido      (sockets, daemons, DNS/ARP/NetBIOS)" -ForegroundColor White
+        Write-Host "  [6]  Limpieza Total      (cache + cookies + Device ID + sesiones)" -ForegroundColor White
+        Write-Host "  [7]  Stats de Tokens     (sesiones activas, tokens, TOP infladoras)" -ForegroundColor Green
+        Write-Host "  [8]  Cambiar a OpenRouter (fix alternativo: 20+ modelos sin limite diario)" -ForegroundColor Yellow
+        Write-Host "  [9]  Salir" -ForegroundColor Gray
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  Selecciona una opcion [1-8]: " -NoNewline -ForegroundColor Cyan
+        Write-Host "  Selecciona una opcion [1-9]: " -NoNewline -ForegroundColor Cyan
         
         $choice = Read-Host
 
@@ -965,6 +1276,9 @@ function Show-InteractiveMenu {
                 [Console]::ReadKey($true) | Out-Null
             }
             "3" {
+                Invoke-TorQuotaRenew
+            }
+            "4" {
                 Show-Banner
                 Write-Host "  APLICANDO TOKENS AMPLIADOS (session_v2 archive + reasoning opt)" -ForegroundColor Cyan
                 Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
@@ -985,26 +1299,26 @@ function Show-InteractiveMenu {
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
-            "4" {
+            "5" {
                 Invoke-FullReset
                 Write-Host ""
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
-            "5" {
+            "6" {
                 Invoke-FullReset -ForceCleanSession
                 Write-Host ""
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
-            "6" {
+            "7" {
                 Show-Banner
                 Show-TokenStats
                 Write-Host ""
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
-            "7" {
+            "8" {
                 Show-Banner
                 Write-Host "  CAMBIAR A OPENROUTER FREE (sin limite diario de mensajes)" -ForegroundColor Yellow
                 Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
@@ -1025,8 +1339,9 @@ function Show-InteractiveMenu {
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
-            "8" {
+            "9" {
                 Write-Host "Saliendo... Hasta pronto!" -ForegroundColor Cyan
+                Stop-TorDaemon
                 return
             }
             Default {
@@ -1059,5 +1374,7 @@ switch ($Action.ToLower()) {
     "--reset"       { Invoke-FullReset }
     "clean"         { Invoke-FullReset -ForceCleanSession }
     "--clean"       { Invoke-FullReset -ForceCleanSession }
+    "tor"           { Invoke-TorQuotaRenew }
+    "--tor"         { Invoke-TorQuotaRenew }
     Default         { Show-InteractiveMenu }
 }
