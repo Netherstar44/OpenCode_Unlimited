@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title OpenCode Unlimited - Made By Jose David Correa ~ github: Netherstar44
+title OpenCode Unlimited - Made By Jose David Correa ~Netherstar44 & Juan Esteban Bustos ~juanitogit
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$scriptContent = (Get-Content -LiteralPath '%~f0' -Encoding UTF8 | Select-Object -Skip 5) -join [Environment]::NewLine; & ([scriptblock]::Create($scriptContent)) @args" %*
 exit /b %ERRORLEVEL%
 # --- POWERSHELL ENGINE STARTS HERE ---
@@ -33,7 +33,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $global:LogFile = Join-Path $env:TEMP "opencode_unlimited.log"
 $global:PidFile = Join-Path $env:TEMP "opencode_unlimited.pid"
-$global:AuthorCredit = "Made By Jose David Correa ~ github: Netherstar44"
+$global:AuthorCredit = "Made By Jose David Correa ~Netherstar44 & Juan Esteban Bustos ~juanitogit"
 
 # =============================================================================
 # LOGGING & NOTIFICATIONS
