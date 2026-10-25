@@ -108,12 +108,15 @@ function Get-PublicIP {
         "https://api.ipify.org",
         "https://icanhazip.com",
         "https://checkip.amazonaws.com",
+        "https://ipinfo.io/ip",
         "https://ifconfig.me/ip"
     )
     foreach ($url in $endpoints) {
         try {
             $req = [System.Net.WebRequest]::Create($url)
-            $req.Timeout = 2500
+            $req.Timeout = 1500
+            $req.KeepAlive = $false
+            $req.Proxy = $null
             $res = $req.GetResponse()
             $stream = $res.GetResponseStream()
             $reader = [System.IO.StreamReader]::new($stream)
@@ -296,52 +299,89 @@ function Invoke-FullReset {
 
 function Invoke-RenewQuotaFlow {
     Show-Banner
+
+    Write-Host "  Detectando IP publica actual..." -ForegroundColor DarkGray
     $initialIP = Get-PublicIP
+
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  RENOVAR CUOTA / CAMBIAR DE VPN" -ForegroundColor Yellow
-    Write-Host "  IP Pública Actual: $initialIP" -ForegroundColor Cyan
+    Write-Host "  IP de Salida Registrada: $initialIP" -ForegroundColor Cyan
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  [1/2] Por favor, ve a tu aplicación de VPN (ej. UrbanVPN) y cambia de país o reconecta." -ForegroundColor White
-    Write-Host "  [2/2] Esperando automáticamente a que tu IP pública cambie..." -ForegroundColor Gray
+    Write-Host "  PASOS:" -ForegroundColor White
+    Write-Host "  1. Abre tu app de VPN y cambia de pais / servidor / reconecta." -ForegroundColor White
+    Write-Host "  2. El script detecta la nueva IP y ejecuta el reset automaticamente." -ForegroundColor Gray
+    Write-Host "  3. O presiona ENTER en cualquier momento para forzar el reset ya." -ForegroundColor Gray
     Write-Host ""
 
-    # Notificación no invasiva de Windows
     Send-ToastNotification `
-        -Title "⚡ OpenCode Unlimited: Cuota / VPN" `
-        -Message "Límite detectado. Cambia de país/servidor en tu VPN para continuar. Esperando nueva IP..."
+        -Title "Cambiar de VPN ahora" `
+        -Message "OpenCode Unlimited esperando nueva IP. Cambia de pais en tu VPN."
 
-    Write-EngineLog "Esperando detección de nueva IP pública externa..." "NOTIFY"
+    Write-EngineLog "Monitoreo de IP publica iniciado. IP base: $initialIP" "NOTIFY"
 
-    $attempts = 0
-    $maxAttempts = 120 # 2 minutos
+    $attempts      = 0
+    $maxAttempts   = 180
     $detectedNewIP = $null
+    $wasOffline    = $false
+    $lastLine      = ""
+
+    # Job paralelo que espera ENTER sin bloquear el loop
+    $inputPS = [System.Management.Automation.PowerShell]::Create()
+    $null = $inputPS.AddScript({ try { [Console]::ReadLine() } catch { $null } })
+    $inputHandle = $inputPS.BeginInvoke()
 
     while ($attempts -lt $maxAttempts) {
-        Start-Sleep -Seconds 1
-        $attempts++
-        $checkIP = Get-PublicIP
 
-        if ($checkIP -ne $initialIP -and $checkIP -notmatch "Desconocida") {
-            $detectedNewIP = $checkIP
+        # Usuario presiono ENTER -> forzar reset inmediato
+        if ($inputHandle.IsCompleted) {
+            Write-Host ""
+            Write-Host "  >> ENTER detectado: forzando reset con la conexion actual..." -ForegroundColor Magenta
+            $detectedNewIP = Get-PublicIP
             break
         }
 
-        if ($attempts % 5 -eq 0) {
-            Write-Host "  ... Siguiendo a la espera de cambio de IP ($attempts segs) - IP actual: $checkIP" -ForegroundColor DarkGray
+        Start-Sleep -Milliseconds 800
+        $attempts++
+
+        $checkIP = Get-PublicIP
+
+        if ($checkIP -match "Desconocida") {
+            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Transitando VPN... (sin internet - normal durante el cambio) [$attempts s]"
+            $statusColor = "DarkYellow"
+            $wasOffline  = $true
+        } elseif ($checkIP -ne $initialIP) {
+            $detectedNewIP = $checkIP
+            break
+        } elseif ($wasOffline) {
+            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Online nuevamente pero misma IP ($checkIP) - cambia de servidor [$attempts s]"
+            $statusColor = "Yellow"
+            $wasOffline  = $false
+        } else {
+            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Esperando cambio de IP... actual: $checkIP  [$attempts s]"
+            $statusColor = "DarkGray"
+        }
+
+        if ($statusLine -ne $lastLine) {
+            Write-Host ("`r" + $statusLine.PadRight(88)) -ForegroundColor $statusColor -NoNewline
+            $lastLine = $statusLine
         }
     }
 
-    if ($detectedNewIP) {
+    try { $inputPS.Stop(); $inputPS.Dispose() } catch {}
+    Write-Host ""   # salto de linea
+
+    if ($detectedNewIP -and $detectedNewIP -notmatch "Desconocida") {
         Write-Host ""
-        Write-Host "  ¡Nueva IP detectada: $detectedNewIP!" -ForegroundColor Green
-        Write-Host "  Estabilizando rutas y ejecutando limpieza de entorno..." -ForegroundColor Cyan
+        Write-Host "  Nueva IP detectada: $detectedNewIP" -ForegroundColor Green
+        Write-Host "  Estabilizando rutas ($Debounce s) y ejecutando limpieza completa..." -ForegroundColor Cyan
         Start-Sleep -Seconds $Debounce
         Invoke-FullReset -ForceCleanSession -NewIP $detectedNewIP
+        Write-EngineLog "Cuota renovada. Nueva IP activa: $detectedNewIP" "SUCCESS"
     } else {
         Write-Host ""
-        Write-Host "  No se detectó cambio de IP tras 2 minutos." -ForegroundColor Yellow
-        Write-Host "  ¿Deseas forzar el reseteo de red y OpenCode con la IP actual? (S/N): " -NoNewline -ForegroundColor White
+        Write-Host "  No se detecto cambio de IP." -ForegroundColor Yellow
+        Write-Host "  Deseas forzar el reseteo de OpenCode con la IP actual? (S/N): " -NoNewline -ForegroundColor White
         $resp = Read-Host
         if ($resp -match "^[sSyY]") {
             Invoke-FullReset -ForceCleanSession
