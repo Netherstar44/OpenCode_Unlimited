@@ -102,10 +102,6 @@ function Show-Banner {
 # NETWORK & IP DETECTION
 # =============================================================================
 
-# =============================================================================
-# NETWORK & IP DETECTION
-# =============================================================================
-
 try {
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
     [System.Net.ServicePointManager]::DnsRefreshTimeout = 0
@@ -172,6 +168,53 @@ function Get-NetworkSignature {
 function Get-RoutingSignature { return Get-NetworkSignature }
 function Get-LocalAdaptersSignature { return Get-NetworkSignature }
 
+# Test-OpenCodeQuotaAvailable: Sondea directamente opencode.ai para verificar si la IP actual
+# tiene cuota diaria disponible para modelos gratuitos (evita reabrir OpenCode con IP quemada)
+function Test-OpenCodeQuotaAvailable {
+    param([int]$TimeoutMs = 3500)
+    try {
+        $url = 'https://opencode.ai/inference/openai/v1/chat/completions'
+        $req = [System.Net.HttpWebRequest]::Create($url)
+        $req.Method = 'POST'
+        $req.Timeout = $TimeoutMs
+        $req.ReadWriteTimeout = $TimeoutMs
+        $req.KeepAlive = $false
+        $req.Proxy = $null
+        $req.ContentType = 'application/json'
+        $req.Headers.Add('Authorization', 'Bearer public')
+        $req.UserAgent = 'opencode/2.1.4'
+        $payload = '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"1"}],"max_tokens":1}'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $req.ContentLength = $bytes.Length
+        $reqStream = $req.GetRequestStream()
+        $reqStream.Write($bytes, 0, $bytes.Length)
+        $reqStream.Close()
+        $res = $req.GetResponse()
+        $res.Close()
+        return @{ Available = $true; Status = 200; Reason = "CUOTA_DISPONIBLE" }
+    } catch [System.Net.WebException] {
+        $ex = $_.Exception
+        $statusCode = 0
+        $body = ""
+        if ($ex.Response) {
+            $resp = [System.Net.HttpWebResponse]$ex.Response
+            $statusCode = [int]$resp.StatusCode
+            try {
+                $reader = [System.IO.StreamReader]::new($resp.GetResponseStream())
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+            } catch {}
+            $resp.Close()
+        }
+        if ($statusCode -eq 429 -or $body -match 'FreeUsageLimitError|rate-limit') {
+            return @{ Available = $false; Status = $statusCode; Reason = "CUOTA_AGOTADA_HOY" }
+        }
+        return @{ Available = $false; Status = $statusCode; Reason = "ERROR_CONEXION" }
+    } catch {
+        return @{ Available = $false; Status = 0; Reason = $_.Exception.Message }
+    }
+}
+
 # =============================================================================
 # PROCESSES & DAEMON MANAGEMENT
 # =============================================================================
@@ -180,41 +223,36 @@ function Stop-OpenCodeProcesses {
     $foundDesktop = $false
     $desktopPath = $null
 
-    # 1. Cerrar OpenCode Desktop primero para evitar que respawnee el daemon CLI
+    # 1. Localizar ruta de OpenCode Desktop antes del cierre
     $desktopProcs = Get-Process -Name "OpenCode" -ErrorAction SilentlyContinue
     if ($desktopProcs) {
         $foundDesktop = $true
         try { $desktopPath = $desktopProcs[0].Path } catch {}
-        Write-EngineLog "Cerrando OpenCode Desktop para destruir sockets TCP colgados..." "ACTION"
-        Stop-Process -Name "OpenCode" -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 600
     }
-
     if (-not $desktopPath) {
         $candidate = "$env:LOCALAPPDATA\Programs\@opencodedesktop\OpenCode.exe"
         if (Test-Path $candidate) { $desktopPath = $candidate }
     }
 
+    Write-EngineLog "Cerrando OpenCode Desktop, CLI y Daemons para liberar sockets..." "ACTION"
+
     # 2. Detener servicio formalmente si está activo
     try { & opencode service stop 2>$null | Out-Null } catch {}
 
-    # 3. Forzar terminación de todos los daemons CLI y ejecutables de servicio
-    $targetProcessNames = @("opencode", "opencode-cli")
-    foreach ($pName in $targetProcessNames) {
-        $procs = Get-Process -Name $pName -ErrorAction SilentlyContinue
-        if ($procs) {
-            Write-EngineLog "Terminando $($procs.Count) instancia(s) de $pName..." "ACTION"
-            Stop-Process -Name $pName -Force -ErrorAction SilentlyContinue
-        }
+    # 3. Forzar terminación completa de todo el árbol de procesos con taskkill
+    & taskkill.exe /F /T /IM "OpenCode.exe" /IM "opencode-cli.exe" /IM "opencode.exe" 2>$null | Out-Null
+
+    # 4. Asegurar eliminación vía PowerShell Stop-Process
+    @("OpenCode", "opencode-cli", "opencode") | ForEach-Object {
+        Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue
     }
 
-    # 4. Terminar procesos dinámicos huérfanos de servicio (opencode-service-*.exe)
+    # 5. Terminar procesos dinámicos huérfanos de servicio (opencode-service-*.exe)
     Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "*opencode-service*" } | ForEach-Object {
-        Write-EngineLog "Terminando proceso de servicio: $($_.ProcessName) (PID: $($_.Id))..." "ACTION"
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
 
-    # 5. Limpiar archivos de bloqueo residuales
+    # 6. Limpiar archivos de bloqueo residuales
     $locksDir = "$env:USERPROFILE\.local\state\opencode\locks"
     if (Test-Path $locksDir) {
         try { Remove-Item -Path "$locksDir\*" -Force -Recurse -ErrorAction SilentlyContinue } catch {}
@@ -243,17 +281,45 @@ function Rotate-OpenCodeDeviceIdentity {
         Write-EngineLog "Nuevo Device ID generado: $newGuid" "SUCCESS"
     } catch {}
 
-    # 2. Eliminar service.json para que el daemon genere un nuevo Service UUID al reiniciar
-    $serviceJson = "$env:USERPROFILE\.local\state\opencode\service.json"
-    if (Test-Path $serviceJson) {
-        try {
-            Remove-Item -Path $serviceJson -Force -ErrorAction SilentlyContinue
-            Write-EngineLog "ID de servicio anterior eliminado (se creará una sesión de servicio virgen)." "SUCCESS"
-        } catch {}
+    # 2. Eliminar service.json en AMBAS rutas (.local y .config) para crear sesión de servicio virgen
+    $serviceJsonPaths = @(
+        "$env:USERPROFILE\.local\state\opencode\service.json",
+        "$env:USERPROFILE\.config\opencode\service.json"
+    )
+    foreach ($sp in $serviceJsonPaths) {
+        if (Test-Path $sp) {
+            try {
+                Remove-Item -Path $sp -Force -ErrorAction SilentlyContinue
+                Write-EngineLog "ID de servicio anterior eliminado en $(Split-Path $sp -Leaf)." "SUCCESS"
+            } catch {}
+        }
     }
 
-    # 3. Limpiar huellas locales de nivel db y tokens en ai.opencode.desktop (preservando configuración)
+    # 3. Eliminar archivos de estado de ventana para evitar restaurar el chat con error 429
     $desktopApp = "$env:APPDATA\ai.opencode.desktop"
+    if (Test-Path $desktopApp) {
+        Get-ChildItem -Path $desktopApp -Filter "window-state*.json" -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    # 4. Limpiar borradores y prompts caídos de drafts.sqlite
+    $draftsDb = Join-Path $desktopApp "drafts.sqlite"
+    if (Test-Path $draftsDb) {
+        $pyDraft = @"
+import sqlite3, os
+p = os.path.expanduser(r'~\AppData\Roaming\ai.opencode.desktop\drafts.sqlite')
+if os.path.exists(p):
+    conn = sqlite3.connect(p)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM document WHERE key LIKE '%:session:%' OR key LIKE '%:draft:%'")
+    conn.commit()
+    conn.close()
+"@
+        try { python -c $pyDraft 2>$null } catch {}
+    }
+
+    # 5. Limpiar huellas locales de nivel db y cookies en ai.opencode.desktop (preservando config)
     $identityPaths = @(
         "Local Storage",
         "Session Storage",
@@ -531,41 +597,52 @@ function Invoke-FullReset {
 function Invoke-RenewQuotaFlow {
     Show-Banner
 
-    Write-Host "  Detectando estado de red inicial..." -ForegroundColor DarkGray
+    Write-Host "  Comprobando red y estado actual de cuota..." -ForegroundColor DarkGray
     $initialSig = Get-NetworkSignature
     $initialIP  = Get-PublicIP
+    $probeInit  = Test-OpenCodeQuotaAvailable -TimeoutMs 3500
 
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  RENOVAR CUOTA / TOKENS AMPLIADOS" -ForegroundColor Yellow
     Write-Host "  IP Actual: $initialIP" -ForegroundColor Cyan
+    if ($probeInit.Available) {
+        Write-Host "  Estado de Cuota en IP Actual: [DISPONIBLE (100% LIMPIA)]" -ForegroundColor Green
+    } elseif ($probeInit.Reason -eq 'CUOTA_AGOTADA_HOY') {
+        Write-Host "  Estado de Cuota en IP Actual: [AGOTADA HOY (429) - REQUIERE OTRA IP/VPN]" -ForegroundColor Red
+    } else {
+        Write-Host "  Estado de Cuota en IP Actual: [$($probeInit.Reason)]" -ForegroundColor DarkYellow
+    }
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  PASOS:" -ForegroundColor White
-    Write-Host "  1. Abre tu VPN (ej. UrbanVPN) y conecta o cambia de pais/servidor." -ForegroundColor White
-    Write-Host "  2. El monitor detecta la nueva VPN/IP y resetea OpenCode AUTOMATICAMENTE." -ForegroundColor Green
-    Write-Host "  3. O presiona ENTER en cualquier momento para forzar la renovacion ya." -ForegroundColor Gray
+    Write-Host "  COMO RENOVAR CUOTA CON EXITO:" -ForegroundColor White
+    Write-Host "  1. En tu VPN (ej. UrbanVPN), conecta o cambia a otro pais (ej: Suiza, Japon," -ForegroundColor White
+    Write-Host "     Islandia, Noruega, Singapur, Canada... evita paises saturados)." -ForegroundColor White
+    Write-Host "  2. El monitor detecta la nueva conexion y VERIFICA que la IP tenga cuota real." -ForegroundColor Green
+    Write-Host "  3. Si la VPN te asigna una IP ya consumida hoy por otro usuario, te avisara" -ForegroundColor Yellow
+    Write-Host "     inmediatamente para que elijas otro pais sin perder tiempo." -ForegroundColor Yellow
+    Write-Host "  4. Cuando confirme una IP con cuota 100% libre, reseteara y abrira OpenCode." -ForegroundColor Cyan
+    Write-Host "  (Presiona ENTER en cualquier momento para forzar renovacion con la IP actual)" -ForegroundColor DarkGray
     Write-Host ""
 
     Send-ToastNotification `
         -Title "Cambiar de VPN ahora" `
-        -Message "OpenCode Unlimited esperando nueva IP. Conecta o cambia de servidor en tu VPN."
+        -Message "OpenCode Unlimited esperando nueva IP limpia. Conecta o cambia de país en tu VPN."
 
-    Write-EngineLog "Esperando cambio de red o IP... (Base: $initialIP)" "NOTIFY"
+    Write-EngineLog "Esperando cambio de red o IP con cuota libre... (Base: $initialIP)" "NOTIFY"
 
-    $attempts      = 0
-    $maxAttempts   = 240
-    $detectedNewIP = $null
-    $detectedSigChange = $false
-    $lastLine      = ""
+    $attempts          = 0
+    $maxAttempts       = 240
+    $detectedCleanIP   = $null
+    $lastLine          = ""
 
     while ($attempts -lt $maxAttempts) {
-        # Comprobar si el usuario presionó una tecla (no bloqueante)
+        # Comprobar si el usuario presiono una tecla (no bloqueante)
         if ([Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
             if ($key.Key -eq 'Enter' -or $key.Key -eq 'Spacebar') {
                 Write-Host ""
                 Write-Host "  >> ENTER detectado: forzando renovacion con la conexion actual..." -ForegroundColor Magenta
-                $detectedNewIP = Get-PublicIP
+                $detectedCleanIP = Get-PublicIP
                 break
             }
         }
@@ -573,43 +650,76 @@ function Invoke-RenewQuotaFlow {
         Start-Sleep -Milliseconds 800
         $attempts++
 
-        # Detección instantánea por adaptador/ruteo VPN (0ms)
+        # 1. Deteccion instantanea por cambio de adaptador o rutas VPN
         $curSig = Get-NetworkSignature
-        if ($curSig -ne $initialSig) {
-            $detectedSigChange = $true
+        $sigChanged = ($curSig -ne $initialSig)
+
+        if ($sigChanged) {
             Write-Host ""
             Write-EngineLog "¡Cambio de adaptador/VPN detectado en tiempo real!" "SUCCESS"
             Write-Host "  Estabilizando rutas de la nueva conexion ($Debounce s)..." -ForegroundColor Cyan
             Start-Sleep -Seconds $Debounce
 
-            # Intentar leer nueva IP
-            for ($k = 0; $k -lt 6; $k++) {
-                $tryIP = Get-PublicIP
-                if ($tryIP -notmatch "Desconocida" -and $tryIP -ne $initialIP) {
-                    $detectedNewIP = $tryIP
+            $newIP = Get-PublicIP
+            if ($newIP -notmatch "Desconocida") {
+                Write-EngineLog "Nueva IP detectada: $newIP. Verificando disponibilidad de cuota en opencode.ai..." "ACTION"
+                $probe = Test-OpenCodeQuotaAvailable -TimeoutMs 4000
+                if ($probe.Available) {
+                    Write-EngineLog "¡IP LIMPIA CONFIRMADA ($newIP)! Cuota de mensajes 100% disponible." "SUCCESS"
+                    $detectedCleanIP = $newIP
+                    break
+                } elseif ($probe.Reason -eq 'CUOTA_AGOTADA_HOY') {
+                    Write-EngineLog "AVISO: La IP asignada ($newIP) ya fue quemada hoy por otro usuario en este nodo VPN." "WARN"
+                    Write-Host ""
+                    Write-Host "  =========================================================================" -ForegroundColor Yellow
+                    Write-Host "  ⚠️  LA IP $newIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
+                    Write-Host "  Como UrbanVPN es publica y compartida, otro usuario en ese nodo ya la agoto." -ForegroundColor Yellow
+                    Write-Host "  >> SOLUCION: En tu VPN, selecciona OTRO PAIS diferente (ej: Suiza, Islandia," -ForegroundColor Green
+                    Write-Host "     Suecia, Noruega, Singapur, Japon, Canada) y conecta de nuevo." -ForegroundColor Green
+                    Write-Host "  =========================================================================" -ForegroundColor Yellow
+                    Write-Host ""
+                    $initialIP  = $newIP
+                    $initialSig = Get-NetworkSignature
+                    continue
+                } else {
+                    Write-EngineLog "IP detectada ($newIP). Estado de cuota: $($probe.Reason)" "INFO"
+                    $detectedCleanIP = $newIP
                     break
                 }
-                Start-Sleep -Seconds 1
             }
-            if (-not $detectedNewIP) {
-                $detectedNewIP = Get-PublicIP
-            }
-            break
         }
 
-        # Detección complementaria por IP pública cada 3 segundos
+        # 2. Deteccion complementaria por consulta de IP cada 3 segundos
         if ($attempts % 3 -eq 0) {
             $checkIP = Get-PublicIP
             if ($checkIP -match "Desconocida") {
                 $statusLine = "  [$(Get-Date -Format 'HH:mm:ss')] Negociando VPN... (esperando enlace) [$attempts s]"
                 $statusColor = "DarkYellow"
             } elseif ($checkIP -ne $initialIP) {
-                $detectedNewIP = $checkIP
                 Write-Host ""
-                Write-EngineLog "¡Nueva IP publica detectada: $checkIP!" "SUCCESS"
-                break
+                Write-EngineLog "Nueva IP detectada: $checkIP. Verificando cuota en opencode.ai..." "ACTION"
+                $probe = Test-OpenCodeQuotaAvailable -TimeoutMs 4000
+                if ($probe.Available) {
+                    Write-EngineLog "¡IP LIMPIA CONFIRMADA ($checkIP)! Cuota de mensajes 100% disponible." "SUCCESS"
+                    $detectedCleanIP = $checkIP
+                    break
+                } elseif ($probe.Reason -eq 'CUOTA_AGOTADA_HOY') {
+                    Write-EngineLog "AVISO: La IP asignada ($checkIP) ya fue quemada hoy por otro usuario." "WARN"
+                    Write-Host ""
+                    Write-Host "  =========================================================================" -ForegroundColor Yellow
+                    Write-Host "  ⚠️  LA IP $checkIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
+                    Write-Host "  >> Por favor cambia a OTRO PAIS en tu VPN para obtener una IP limpia..." -ForegroundColor Yellow
+                    Write-Host "  =========================================================================" -ForegroundColor Yellow
+                    Write-Host ""
+                    $initialIP  = $checkIP
+                    $initialSig = Get-NetworkSignature
+                    continue
+                } else {
+                    $detectedCleanIP = $checkIP
+                    break
+                }
             } else {
-                $statusLine = "  [$(Get-Date -Format 'HH:mm:ss')] Esperando cambio en VPN... actual: $checkIP [$attempts s]"
+                $statusLine = "  [$(Get-Date -Format 'HH:mm:ss')] Esperando cambio en VPN... IP actual: $checkIP [$attempts s]"
                 $statusColor = "DarkGray"
             }
 
@@ -622,18 +732,16 @@ function Invoke-RenewQuotaFlow {
 
     Write-Host ""
 
-    if ($detectedNewIP -and $detectedNewIP -notmatch "Desconocida") {
+    if ($detectedCleanIP -and $detectedCleanIP -notmatch "Desconocida") {
         Write-Host ""
-        Write-Host "  Nueva IP confirmada: $detectedNewIP" -ForegroundColor Green
-        Write-Host "  Aplicando Tokens Ampliados y rotando identidad..." -ForegroundColor Cyan
-        Invoke-FullReset -ForceCleanSession -NewIP $detectedNewIP
-        Write-EngineLog "Cuota renovada con exito. Nueva IP activa: $detectedNewIP" "SUCCESS"
-    } elseif ($detectedSigChange) {
+        Write-Host "  =========================================================================" -ForegroundColor Cyan
+        Write-Host "  IP CONFIRMADA: $detectedCleanIP" -ForegroundColor Green
+        Write-Host "  Aplicando Tokens Ampliados, rotando Device ID y reiniciando OpenCode..." -ForegroundColor Cyan
+        Write-Host "  =========================================================================" -ForegroundColor Cyan
+        Invoke-FullReset -ForceCleanSession -NewIP $detectedCleanIP
+        Write-EngineLog "¡Cuota renovada con exito! OpenCode iniciado con IP limpia: $detectedCleanIP" "SUCCESS"
         Write-Host ""
-        Write-Host "  Red cambiada exitosamente. Aplicando reseteo completo..." -ForegroundColor Green
-        $confirmedIP = Get-PublicIP
-        Invoke-FullReset -ForceCleanSession -NewIP $confirmedIP
-        Write-EngineLog "Cuota renovada con exito. IP activa: $confirmedIP" "SUCCESS"
+        Write-Host "  IMPORTANTE: Inicia un NUEVO CHAT (Ctrl + N) para aprovechar la cuota virgen." -ForegroundColor Yellow
     } else {
         Write-Host ""
         Write-Host "  No se detecto cambio automatico de red/IP." -ForegroundColor Yellow
@@ -767,17 +875,27 @@ function Invoke-WatchLoop {
 function Show-InteractiveMenu {
     while ($true) {
         Show-Banner
-        Write-Host "  Obteniendo IP publica..." -ForegroundColor DarkGray
-        $currentIP = Get-PublicIP
-        Write-Host "  IP Publica Actual: $currentIP" -ForegroundColor Yellow
+        Write-Host "  Consultando conexion y cuota diaria..." -ForegroundColor DarkGray
+        $currentIP   = Get-PublicIP
+        $quotaStatus = Test-OpenCodeQuotaAvailable -TimeoutMs 2500
+
+        Write-Host "  IP Publica Actual:  $currentIP" -ForegroundColor Cyan
+        if ($quotaStatus.Available) {
+            Write-Host "  Estado de Cuota IP: [DISPONIBLE (100% LIMPIA)]" -ForegroundColor Green
+        } elseif ($quotaStatus.Reason -eq 'CUOTA_AGOTADA_HOY') {
+            Write-Host "  Estado de Cuota IP: [AGOTADA HOY (429) - Cambia de VPN/Pais]" -ForegroundColor Red
+        } else {
+            Write-Host "  Estado de Cuota IP: [$($quotaStatus.Reason)]" -ForegroundColor DarkYellow
+        }
+
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
         Write-Host "  [1]  Monitor Automatico  (ruteo+IP cada 3s, reset automatico 24/7)" -ForegroundColor White
-        Write-Host "  [2]  Renovar Cuota       (espera nueva IP + rota Device ID)" -ForegroundColor White
-        Write-Host "  [3]  Tokens Ampliados    (archiva session_v2 + limpia inbox)" -ForegroundColor Cyan
+        Write-Host "  [2]  Renovar Cuota       (detecta nueva IP + valida cuota libre + rota ID)" -ForegroundColor White
+        Write-Host "  [3]  Tokens Ampliados    (archiva session_v2 + limpia inbox a contexto 0)" -ForegroundColor Cyan
         Write-Host "  [4]  Reseteo Rapido      (sockets, daemons, DNS/ARP/NetBIOS)" -ForegroundColor White
         Write-Host "  [5]  Limpieza Total      (cache + cookies + Device ID + sesiones)" -ForegroundColor White
         Write-Host "  [6]  Stats de Tokens     (sesiones activas, tokens, TOP infladoras)" -ForegroundColor Green
-        Write-Host "  [7]  Cambiar a OpenRouter (fix: 'You've used today's free messages')" -ForegroundColor Yellow
+        Write-Host "  [7]  Cambiar a OpenRouter (fix alternativo: 20+ modelos sin limite diario)" -ForegroundColor Yellow
         Write-Host "  [8]  Salir" -ForegroundColor Gray
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
         Write-Host "  Selecciona una opcion [1-8]: " -NoNewline -ForegroundColor Cyan
@@ -837,17 +955,21 @@ function Show-InteractiveMenu {
             }
             "7" {
                 Show-Banner
-                Write-Host "  CAMBIAR A OPENROUTER FREE (sin limite diario)" -ForegroundColor Yellow
+                Write-Host "  CAMBIAR A OPENROUTER FREE (sin limite diario de mensajes)" -ForegroundColor Yellow
                 Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-                Write-Host "  El error 'You ve used today s free messages' ocurre cuando el proveedor" -ForegroundColor Gray
-                Write-Host "  opencode agota su cuota diaria. OpenRouter tiene modelos gratis sin ese limite." -ForegroundColor Gray
+                Write-Host "  El proveedor 'opencode' impone limite diario gratuito por IP." -ForegroundColor Gray
+                Write-Host "  OpenRouter tiene docenas de modelos gratis sin cuota fija de mensajes." -ForegroundColor Gray
                 Write-Host ""
                 Switch-ToOpenRouterFreeModel
                 Write-Host ""
-                Write-Host "  Hecho! En OpenCode selecciona uno de estos modelos:" -ForegroundColor Green
+                Write-Host "  Hecho! En OpenCode puedes usar estos modelos gratis:" -ForegroundColor Green
                 Write-Host "  - nvidia/nemotron-3.5-lightning:free  (1M contexto)" -ForegroundColor Cyan
                 Write-Host "  - nvidia/nemotron-3.5-super-vl:free   (1M contexto)" -ForegroundColor Cyan
                 Write-Host "  - deepseek/deepseek-chat-v3-0324:free" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "  IMPORTANTE (Si usas OpenRouter):" -ForegroundColor Yellow
+                Write-Host "  Si OpenRouter da error 'zdr-violation-by-account', desactiva ZDR en:" -ForegroundColor Gray
+                Write-Host "  https://openrouter.ai/settings/privacy -> Desmarcar 'Enforce Zero Data Retention'" -ForegroundColor Magenta
                 Write-Host ""
                 Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null

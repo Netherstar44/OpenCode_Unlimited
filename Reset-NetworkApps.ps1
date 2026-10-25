@@ -110,6 +110,9 @@ $cliCount = 0
 if ($KillCli) {
     try { & opencode service stop 2>$null | Out-Null } catch {}
 
+    # Forzar terminación de todo el árbol de procesos con taskkill
+    & taskkill.exe /F /T /IM "OpenCode.exe" /IM "opencode-cli.exe" /IM "opencode.exe" 2>$null | Out-Null
+
     $targetProcessNames = @("opencode", "opencode-cli")
     foreach ($pName in $targetProcessNames) {
         $cliProcesses = Get-Process -Name $pName -ErrorAction SilentlyContinue
@@ -132,11 +135,36 @@ try {
     $updaterIdPath = "$env:APPDATA\ai.opencode.desktop\.updaterId"
     [guid]::NewGuid().ToString() | Set-Content -LiteralPath $updaterIdPath -Force -ErrorAction SilentlyContinue
     
-    $serviceJson = "$env:USERPROFILE\.local\state\opencode\service.json"
-    if (Test-Path $serviceJson) { Remove-Item -Path $serviceJson -Force -ErrorAction SilentlyContinue }
+    # Eliminar service.json en ambas rutas
+    @("$env:USERPROFILE\.local\state\opencode\service.json", "$env:USERPROFILE\.config\opencode\service.json") | ForEach-Object {
+        if (Test-Path $_) { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Eliminar estado de ventana para evitar restaurar chat en error
+    $desktopApp = "$env:APPDATA\ai.opencode.desktop"
+    if (Test-Path $desktopApp) {
+        Get-ChildItem -Path $desktopApp -Filter "window-state*.json" -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Limpiar borradores caídos de drafts.sqlite
+    $draftsDb = Join-Path $desktopApp "drafts.sqlite"
+    if (Test-Path $draftsDb) {
+        $pyDraft = @'
+import sqlite3, os
+p = os.path.expanduser(r'~\AppData\Roaming\ai.opencode.desktop\drafts.sqlite')
+if os.path.exists(p):
+    conn = sqlite3.connect(p)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM document WHERE key LIKE '%:session:%' OR key LIKE '%:draft:%'")
+    conn.commit()
+    conn.close()
+'@
+        python -c $pyDraft 2>$null
+    }
 
     # Limpiar cookies y tokens temporales
-    $desktopApp = "$env:APPDATA\ai.opencode.desktop"
     @("Local Storage", "Session Storage", "IndexedDB", "Network\Cookies") | ForEach-Object {
         $targetP = Join-Path $desktopApp $_
         if (Test-Path $targetP) { Remove-Item -Path $targetP -Recurse -Force -ErrorAction SilentlyContinue }
