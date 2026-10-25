@@ -103,6 +103,7 @@ function Show-Banner {
 # =============================================================================
 
 function Get-PublicIP {
+    param([int]$TimeoutMs = 2500)
     $endpoints = @(
         "https://api.ipify.org",
         "https://icanhazip.com",
@@ -113,22 +114,21 @@ function Get-PublicIP {
     foreach ($url in $endpoints) {
         try {
             $req = [System.Net.WebRequest]::Create($url)
-            $req.Timeout = 1500
-            $req.KeepAlive = $false
-            $req.Proxy = $null
-            $res = $req.GetResponse()
+            $req.Timeout          = $TimeoutMs
+            $req.ReadWriteTimeout = $TimeoutMs
+            $req.KeepAlive        = $false
+            $req.Proxy            = $null
+            $res    = $req.GetResponse()
             $stream = $res.GetResponseStream()
             $reader = [System.IO.StreamReader]::new($stream)
-            $ip = ($reader.ReadToEnd()).Trim()
-            $reader.Close()
-            $stream.Close()
-            $res.Close()
+            $ip     = ($reader.ReadToEnd()).Trim()
+            $reader.Close(); $stream.Close(); $res.Close()
             if ($ip -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
                 return $ip
             }
         } catch {}
     }
-    return "Desconocida / Sin Internet"
+    return "Desconocida"
 }
 
 function Get-LocalAdaptersSignature {
@@ -263,21 +263,118 @@ function Rotate-OpenCodeDeviceIdentity {
 
 function Optimize-OpenCodeSessions {
     param([switch]$ForceArchiveAll)
-    Write-EngineLog "Optimizando sesiones infladas para desbloquear cuota completa..." "BOOST"
-    
+    Write-EngineLog "Archivando sesiones infladas de session_v2 para limpiar contexto..." "BOOST"
+
     $dbPath = "$env:USERPROFILE\.local\share\opencode\opencode.db"
-    if (Test-Path $dbPath) {
-        $pyCmd = "import sqlite3, os, time; conn=sqlite3.connect(os.path.expanduser('~/.local/share/opencode/opencode.db')); cur=conn.cursor(); cur.execute('UPDATE session SET time_archived = ? WHERE time_archived IS NULL', (int(time.time()*1000),)); conn.commit(); print(cur.rowcount); conn.close()"
-        try {
-            $archived = & python -c $pyCmd 2>$null
-            if ($archived -and $archived.Trim() -match '^\d+$' -and [int]($archived.Trim()) -gt 0) {
-                Write-EngineLog "Se archivaron $($archived.Trim()) sesión(es) infladas. Próximos comandos iniciarán con 0 tokens de historial." "SUCCESS"
+    if (-not (Test-Path $dbPath)) {
+        Write-EngineLog "Base de datos de OpenCode no encontrada: $dbPath" "WARN"
+        return
+    }
+
+    # Script Python que archiva TODAS las sesiones activas en session_v2
+    # (la tabla real en OpenCode v2.x) y limpia el inbox de contexto pendiente
+    $pyScript = @"
+import sqlite3, os, time
+db = os.path.expanduser(r'~/.local/share/opencode/opencode.db')
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+ts = int(time.time() * 1000)
+
+# Archivar session_v2 (tabla activa en OpenCode >=2.0)
+cur.execute('UPDATE session_v2 SET time_archived = ? WHERE time_archived IS NULL', (ts,))
+n_v2 = cur.rowcount
+
+# Archivar tabla legacy session por si acaso
+cur.execute('UPDATE session SET time_archived = ? WHERE time_archived IS NULL', (ts,))
+n_v1 = cur.rowcount
+
+# Vaciar session_inbox (contexto pendiente en cola que infla tokens)
+cur.execute('DELETE FROM session_inbox')
+n_inbox = cur.rowcount
+
+conn.commit()
+conn.close()
+print(f'{n_v2},{n_v1},{n_inbox}')
+"@
+
+    $tempPy = Join-Path $env:TEMP "oc_archive_sessions.py"
+    $pyScript | Set-Content -LiteralPath $tempPy -Encoding UTF8 -Force
+
+    try {
+        $result = & python $tempPy 2>&1
+        if ($result -and $result -match '^\d+,\d+,\d+$') {
+            $parts  = $result.Trim().Split(',')
+            $nV2    = [int]$parts[0]
+            $nV1    = [int]$parts[1]
+            $nInbox = [int]$parts[2]
+            $total  = $nV2 + $nV1
+            if ($total -gt 0) {
+                Write-EngineLog "Archivadas $nV2 sesion(es) activas de session_v2 + $nV1 legado. Inbox limpiado ($nInbox entradas). Los proximos comandos parten con contexto 0." "SUCCESS"
             } else {
-                Write-EngineLog "Sesiones ya optimizadas (contexto limpio sin arrastre)." "SUCCESS"
+                Write-EngineLog "Sesiones ya archivadas (inbox limpiado: $nInbox entradas). Contexto limpio." "SUCCESS"
             }
-        } catch {
-            Write-EngineLog "Aviso al optimizar sesiones: $($_.Exception.Message)" "WARN"
+        } else {
+            Write-EngineLog "Respuesta inesperada del optimizador: $result" "WARN"
         }
+    } catch {
+        Write-EngineLog "Error al optimizar sesiones: $($_.Exception.Message)" "WARN"
+    } finally {
+        Remove-Item -LiteralPath $tempPy -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-TokenStats {
+    Write-EngineLog "Consultando estadisticas de tokens y sesiones..." "BOOST"
+    $dbPath = "$env:USERPROFILE\.local\share\opencode\opencode.db"
+    if (-not (Test-Path $dbPath)) { Write-EngineLog "DB no encontrada." "ERROR"; return }
+
+    $pyScript = @"
+import sqlite3, os, json
+db = os.path.expanduser(r'~/.local/share/opencode/opencode.db')
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+cur.execute('SELECT count(*) FROM session_v2 WHERE time_archived IS NULL')
+active = cur.fetchone()[0]
+cur.execute('SELECT count(*) FROM session_v2 WHERE time_archived IS NOT NULL')
+archived = cur.fetchone()[0]
+cur.execute('SELECT sum(tokens_input), sum(tokens_output), sum(tokens_reasoning) FROM session_v2 WHERE time_archived IS NULL')
+r = cur.fetchone()
+tin, tout, treason = r[0] or 0, r[1] or 0, r[2] or 0
+cur.execute('SELECT id, title, tokens_input, tokens_output, time_updated FROM session_v2 WHERE time_archived IS NULL ORDER BY tokens_input DESC LIMIT 5')
+top = cur.fetchall()
+cur.execute('SELECT count(*) FROM session_inbox')
+inbox = cur.fetchone()[0]
+conn.close()
+print(f'active={active}')
+print(f'archived={archived}')
+print(f'tokens_in={tin}')
+print(f'tokens_out={tout}')
+print(f'inbox={inbox}')
+for row in top:
+    title = (str(row[1]) or 'Sin titulo')[:40]
+    print(f'TOP|{title}|in={row[2]}|out={row[3]}')
+"@
+    $tempPy = Join-Path $env:TEMP "oc_stats.py"
+    $pyScript | Set-Content -LiteralPath $tempPy -Encoding UTF8 -Force
+    try {
+        $lines = (& python $tempPy 2>&1) -split "`n"
+        Write-Host ""
+        Write-Host "  =============================== ESTADISTICAS DE TOKENS ==============================" -ForegroundColor Cyan
+        foreach ($ln in $lines) {
+            $ln = $ln.Trim()
+            if ($ln -match '^active=(\d+)')          { Write-Host "  Sesiones ACTIVAS (sin archivar): $($Matches[1])" -ForegroundColor $(if ([int]$Matches[1] -gt 5) { 'Red' } else { 'Green' }) }
+            elseif ($ln -match '^archived=(\d+)')    { Write-Host "  Sesiones archivadas: $($Matches[1])" -ForegroundColor Gray }
+            elseif ($ln -match '^tokens_in=(\d+)')   { $m = [math]::Round([int]$Matches[1]/1000,1); Write-Host "  Tokens INPUT acumulados (sesiones activas): ${m}K" -ForegroundColor $(if ([int]$Matches[1] -gt 500000) { 'Red' } else { 'Yellow' }) }
+            elseif ($ln -match '^tokens_out=(\d+)')  { $m = [math]::Round([int]$Matches[1]/1000,1); Write-Host "  Tokens OUTPUT acumulados: ${m}K" -ForegroundColor Gray }
+            elseif ($ln -match '^inbox=(\d+)')       { Write-Host "  Session inbox pendiente: $($Matches[1]) entradas" -ForegroundColor $(if ([int]$Matches[1] -gt 0) { 'Yellow' } else { 'Green' }) }
+            elseif ($ln -match '^TOP\|(.+)\|in=(\d+)\|out=(\d+)') {
+                $ti = [math]::Round([int]$Matches[2]/1000,1)
+                Write-Host "  [TOP] $($Matches[1].PadRight(42)) input=${ti}K" -ForegroundColor DarkYellow
+            }
+        }
+        Write-Host "  ==================================================================================" -ForegroundColor Cyan
+    } finally {
+        Remove-Item -LiteralPath $tempPy -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -287,22 +384,33 @@ function Optimize-TokenConsumptionProfile {
     if (Test-Path $modelJsonPath) {
         try {
             $content = Get-Content -LiteralPath $modelJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($content.variant) {
-                $targetVariant = switch ($Profile) {
-                    "economical" { "default" }
-                    "extreme"    { "max" }
-                    Default      { "high" }
-                }
-                if ($content.variant."opencode/deepseek-v4.1-flash-free") {
-                    $content.variant."opencode/deepseek-v4.1-flash-free" = $targetVariant
-                }
-                if ($content.variant."opencode/nemotron-3.5-super-vl-free") {
-                    $content.variant."opencode/nemotron-3.5-super-vl-free" = $(if ($targetVariant -eq "max") { "xhigh" } else { "high" })
-                }
-                $content | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $modelJsonPath -Encoding UTF8 -Force
-                Write-EngineLog "Perfil de tokens optimizado a: $Profile (Reasoning eficiente para comandos shell)." "SUCCESS"
+            $targetVariant = switch ($Profile) {
+                "economical" { "default" }
+                "extreme"    { "max" }
+                Default      { "high" }
             }
-        } catch {}
+            # Aplicar a todos los modelos presentes en el JSON
+            if ($content.variant) {
+                $modelKeys = @($content.variant.PSObject.Properties.Name)
+                foreach ($mk in $modelKeys) {
+                    $isNemotron = $mk -like '*nemotron*' -or $mk -like '*super-vl*'
+                    $val = if ($isNemotron -and $targetVariant -eq 'max') { 'xhigh' }
+                           elseif ($isNemotron) { 'high' }
+                           else { $targetVariant }
+                    $content.variant.$mk = $val
+                }
+            }
+            if ($content.model) {
+                # Forzar variante tambien en campo raiz si existe
+                try { $content.model.variant = $targetVariant } catch {}
+            }
+            $content | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $modelJsonPath -Encoding UTF8 -Force
+            Write-EngineLog "Perfil de consumo de tokens ajustado a '$Profile' en todos los modelos del JSON." "SUCCESS"
+        } catch {
+            Write-EngineLog "No se pudo ajustar model.json: $($_.Exception.Message)" "WARN"
+        }
+    } else {
+        Write-EngineLog "model.json no encontrado — OpenCode usara configuracion por defecto." "WARN"
     }
 }
 
@@ -502,54 +610,84 @@ function Invoke-RenewQuotaFlow {
 function Invoke-WatchLoop {
     Show-Banner
     Write-Host "  MODO MONITOR ACTIVO (Tokens Ampliados 24/7)" -ForegroundColor Green
-    Write-Host "  Vigilando cambios de VPN, adaptadores y nueva IP pública..." -ForegroundColor White
+    Write-Host "  Vigilando cambios de VPN, IP publica y adaptadores de red..." -ForegroundColor White
     Write-Host "  Presiona Ctrl + C en cualquier momento para detener el monitor." -ForegroundColor DarkGray
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
 
     $PID | Set-Content -Path $global:PidFile -Force -ErrorAction SilentlyContinue
 
-    $lastLocalSig = Get-LocalAdaptersSignature
-    $lastPublicIP = Get-PublicIP
+    $lastLocalSig  = Get-LocalAdaptersSignature
+    $lastPublicIP  = Get-PublicIP -TimeoutMs 3000
+    $publicIPFails = 0   # contador de fallos consecutivos al obtener IP publica
+    $ticksSincePublicCheck = 0
 
-    Write-EngineLog "Monitor iniciado. IP Pública Inicial: $lastPublicIP" "SUCCESS"
+    Write-EngineLog "Monitor iniciado. IP Publica Inicial: $lastPublicIP" "SUCCESS"
 
     $ticks = 0
     while ($true) {
         try {
             Start-Sleep -Seconds $Interval
             $ticks++
+            $ticksSincePublicCheck++
 
+            # --- Detectar cambio en adaptadores locales (siempre rapido) ---
             $currentLocalSig = Get-LocalAdaptersSignature
-            $localChanged = ($currentLocalSig -ne $lastLocalSig)
+            $localChanged    = ($currentLocalSig -ne $lastLocalSig)
+
+            # --- Verificar IP publica: SIEMPRE en cada tick para no perder cambios rapidos ---
+            $currentPublicIP = Get-PublicIP -TimeoutMs 2500
+            $ticksSincePublicCheck = 0
 
             $publicChanged = $false
-            if ($localChanged -or ($ticks % 2 -eq 0)) {
-                $currentPublicIP = Get-PublicIP
-                if ($currentPublicIP -ne $lastPublicIP -and $currentPublicIP -notmatch "Desconocida") {
+            if ($currentPublicIP -notmatch "Desconocida") {
+                $publicIPFails = 0
+                if ($currentPublicIP -ne $lastPublicIP) {
                     $publicChanged = $true
                 }
             } else {
-                $currentPublicIP = $lastPublicIP
+                $publicIPFails++
+                # Si llevamos 3+ intentos sin internet, es transicion de VPN -> esperar y re-chequear
+                if ($publicIPFails -ge 3 -and $localChanged) {
+                    Write-EngineLog "Sin internet por $publicIPFails ciclos consecutivos + cambio local detectado. Esperando reconexion VPN..." "WARN"
+                    # Esperar hasta 30s a que la VPN se establezca
+                    $waitCycles = 0
+                    while ($waitCycles -lt 10) {
+                        Start-Sleep -Seconds 3
+                        $waitCycles++
+                        $tryIP = Get-PublicIP -TimeoutMs 3000
+                        if ($tryIP -notmatch "Desconocida") {
+                            $currentPublicIP = $tryIP
+                            $publicChanged   = ($tryIP -ne $lastPublicIP)
+                            $publicIPFails   = 0
+                            Write-EngineLog "VPN reconnected. Nueva IP: $tryIP" "SUCCESS"
+                            break
+                        }
+                    }
+                }
             }
 
             if ($localChanged -or $publicChanged) {
-                Write-EngineLog "¡Cambio de Red / VPN detectado!" "WARN"
+                Write-EngineLog "Cambio de Red / VPN detectado!" "WARN"
                 if ($publicChanged) {
-                    Write-EngineLog "IP Pública anterior: $lastPublicIP -> Nueva: $currentPublicIP" "ACTION"
+                    Write-EngineLog "IP Publica: $lastPublicIP -> $currentPublicIP" "ACTION"
+                } elseif ($localChanged) {
+                    Write-EngineLog "Cambio de adaptador local detectado (IP publica sin cambio verificado aun)." "ACTION"
                 }
 
                 Send-ToastNotification `
-                    -Title "🔄 Cambio de VPN Detectado" `
-                    -Message "Estabilizando conexión y aplicando Tokens Ampliados a OpenCode..."
+                    -Title "Cambio de VPN Detectado" `
+                    -Message "Estabilizando conexion y aplicando Tokens Ampliados a OpenCode..."
 
                 Write-EngineLog "Esperando $Debounce segundos a que la VPN termine de negociar rutas..." "WARN"
                 Start-Sleep -Seconds $Debounce
 
+                # Actualizar firmas DESPUES del debounce (estado estabilizado)
                 $lastLocalSig = Get-LocalAdaptersSignature
-                $lastPublicIP = Get-PublicIP
+                $confirmedIP  = Get-PublicIP -TimeoutMs 3000
+                if ($confirmedIP -notmatch "Desconocida") { $lastPublicIP = $confirmedIP }
 
                 Invoke-FullReset -NewIP $lastPublicIP
-                Write-EngineLog "Monitoreo reanudado. Esperando próximos cambios de red..." "SUCCESS"
+                Write-EngineLog "Monitoreo reanudado. IP activa: $lastPublicIP" "SUCCESS"
                 Write-Host ""
             }
         } catch {
@@ -566,18 +704,19 @@ function Invoke-WatchLoop {
 function Show-InteractiveMenu {
     while ($true) {
         Show-Banner
-        $currentIP = Get-PublicIP
-        Write-Host "  IP Pública Actual: $currentIP" -ForegroundColor Yellow
+        Write-Host "  Obteniendo IP publica..." -ForegroundColor DarkGray
+        $currentIP = Get-PublicIP -TimeoutMs 3000
+        Write-Host "  IP Publica Actual: $currentIP" -ForegroundColor Yellow
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  [1] 🔄 Iniciar Monitor Automático (Detecta VPN/IP y resetea tokens 24/7)" -ForegroundColor White
-        Write-Host "  [2] ⚡ Renovar Cuota / Tokens Ampliados (Espera nueva IP + Rota ID de Dispositivo)" -ForegroundColor White
-        Write-Host "  [3] 🚀 Modo Tokens Ampliados (Archiva contexto inflado + Optimiza reasoning)" -ForegroundColor Cyan
-        Write-Host "  [4] 🧹 Reseteo Rápido Inmediato (Cierra sockets, daemons y limpia DNS/ARP)" -ForegroundColor White
-        Write-Host "  [5] 🧼 Limpieza Profunda Total (Caché + Cookies + Device ID + Sesiones)" -ForegroundColor White
-        Write-Host "  [6] 📊 Ver Estadísticas de Cuota y Tokens (opencode stats)" -ForegroundColor Gray
-        Write-Host "  [7] ❌ Salir" -ForegroundColor Gray
+        Write-Host "  [1]  Monitor Automatico (detecta VPN/IP cada 3s y resetea tokens 24/7)" -ForegroundColor White
+        Write-Host "  [2]  Renovar Cuota     (espera nueva IP + rota Device ID)" -ForegroundColor White
+        Write-Host "  [3]  Tokens Ampliados  (archiva contexto inflado de session_v2 + optimiza)" -ForegroundColor Cyan
+        Write-Host "  [4]  Reseteo Rapido    (cierra sockets/daemons, limpia DNS/ARP/NetBIOS)" -ForegroundColor White
+        Write-Host "  [5]  Limpieza Total    (cache + cookies + Device ID + sesiones)" -ForegroundColor White
+        Write-Host "  [6]  Stats de Tokens   (sesiones activas, tokens acumulados, TOP infladoras)" -ForegroundColor Green
+        Write-Host "  [7]  Salir" -ForegroundColor Gray
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  Selecciona una opción [1-7]: " -NoNewline -ForegroundColor Cyan
+        Write-Host "  Selecciona una opcion [1-7]: " -NoNewline -ForegroundColor Cyan
         
         $choice = Read-Host
 
@@ -589,51 +728,55 @@ function Show-InteractiveMenu {
             "2" {
                 Invoke-RenewQuotaFlow
                 Write-Host ""
-                Write-Host "Presiona cualquier tecla para volver al menú..." -ForegroundColor Gray
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
             "3" {
                 Show-Banner
-                Write-Host "  APLICANDO MODO TOKENS AMPLIADOS" -ForegroundColor Cyan
+                Write-Host "  APLICANDO TOKENS AMPLIADOS (session_v2 archive + reasoning opt)" -ForegroundColor Cyan
                 Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
+                Show-TokenStats
+                Write-Host ""
+                Write-Host "  Archivando sesiones activas..." -ForegroundColor DarkGray
                 Optimize-OpenCodeSessions -ForceArchiveAll
                 Optimize-TokenConsumptionProfile -Profile "balanced"
                 Write-Host ""
-                Write-Host "  ¡Optimización aplicada!" -ForegroundColor Green
-                Write-Host "  - Se archivó el contexto inflado de comandos previos." -ForegroundColor Gray
-                Write-Host "  - El modelo ahora responderá con reasoning optimizado para comandos shell." -ForegroundColor Gray
-                Write-Host "  - Cada comando enviará ~1k tokens en vez de 100k tokens." -ForegroundColor Yellow
+                Write-Host "  Optimizacion aplicada! RESULTADO:" -ForegroundColor Green
+                Write-Host "  - Se archivaron todas las sesiones activas de session_v2." -ForegroundColor Gray
+                Write-Host "  - Session inbox vaciado (contexto pendiente eliminado)." -ForegroundColor Gray
+                Write-Host "  - Cada NUEVO comando iniciara con 0 tokens de historial." -ForegroundColor Yellow
+                Write-Host "  - Model.json ajustado a reasoning 'high' (eficiente para shell)." -ForegroundColor Gray
                 Write-Host ""
-                Write-Host "Presiona cualquier tecla para volver al menú..." -ForegroundColor Gray
+                Write-Host "  IMPORTANTE: Abre una sesion NUEVA en OpenCode para que aplique." -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
             "4" {
                 Invoke-FullReset
                 Write-Host ""
-                Write-Host "Presiona cualquier tecla para volver al menú..." -ForegroundColor Gray
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
             "5" {
                 Invoke-FullReset -ForceCleanSession
                 Write-Host ""
-                Write-Host "Presiona cualquier tecla para volver al menú..." -ForegroundColor Gray
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
             "6" {
                 Show-Banner
-                Write-Host "  ESTADÍSTICAS DE OPENCODE" -ForegroundColor Cyan
-                Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-                try { & opencode stats } catch { Write-Host "No se pudo ejecutar opencode stats: $_" -ForegroundColor Red }
+                Show-TokenStats
                 Write-Host ""
-                Write-Host "Presiona cualquier tecla para volver al menú..." -ForegroundColor Gray
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
                 [Console]::ReadKey($true) | Out-Null
             }
             "7" {
-                Write-Host "Saliendo... ¡Hasta pronto!" -ForegroundColor Cyan
+                Write-Host "Saliendo... Hasta pronto!" -ForegroundColor Cyan
                 return
             }
             Default {
-                Write-Host "Opción inválida. Intenta de nuevo." -ForegroundColor Red
+                Write-Host "Opcion invalida. Intenta de nuevo." -ForegroundColor Red
                 Start-Sleep -Seconds 1
             }
         }
@@ -645,23 +788,20 @@ function Show-InteractiveMenu {
 # =============================================================================
 
 switch ($Action.ToLower()) {
-    "watch"   { Invoke-WatchLoop }
-    "-w"      { Invoke-WatchLoop }
-    "--watch" { Invoke-WatchLoop }
-    "renew"   { Invoke-RenewQuotaFlow }
-    "-r"      { Invoke-RenewQuotaFlow }
-    "--renew" { Invoke-RenewQuotaFlow }
-    "boost"   { 
-        Optimize-OpenCodeSessions -ForceArchiveAll
-        Optimize-TokenConsumptionProfile -Profile "balanced"
-    }
-    "--boost" { 
-        Optimize-OpenCodeSessions -ForceArchiveAll
-        Optimize-TokenConsumptionProfile -Profile "balanced"
-    }
-    "reset"   { Invoke-FullReset }
-    "--reset" { Invoke-FullReset }
-    "clean"   { Invoke-FullReset -ForceCleanSession }
-    "--clean" { Invoke-FullReset -ForceCleanSession }
-    Default   { Show-InteractiveMenu }
+    "watch"    { Invoke-WatchLoop }
+    "-w"       { Invoke-WatchLoop }
+    "--watch"  { Invoke-WatchLoop }
+    "renew"    { Invoke-RenewQuotaFlow }
+    "-r"       { Invoke-RenewQuotaFlow }
+    "--renew"  { Invoke-RenewQuotaFlow }
+    "boost"    { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
+    "--boost"  { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
+    "stats"    { Show-TokenStats }
+    "--stats"  { Show-TokenStats }
+    "-s"       { Show-TokenStats }
+    "reset"    { Invoke-FullReset }
+    "--reset"  { Invoke-FullReset }
+    "clean"    { Invoke-FullReset -ForceCleanSession }
+    "--clean"  { Invoke-FullReset -ForceCleanSession }
+    Default    { Show-InteractiveMenu }
 }
