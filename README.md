@@ -84,13 +84,14 @@ Haz doble clic en **`OpenCodeUnlimited.bat`**:
 
   IP Pública Actual: 152.204.226.171
 -------------------------------------------------------------------------------
-  [1] 🔄 Iniciar Monitor Automático (Detecta VPN/IP y resetea tokens 24/7)
-  [2] ⚡ Renovar Cuota / Tokens Ampliados (Espera nueva IP + Rota ID de Dispositivo)
-  [3] 🚀 Modo Tokens Ampliados (Archiva contexto inflado + Optimiza reasoning)
+  [1] 🔄 Iniciar Monitor Automático (Detecta VPN/adaptador e IP en tiempo real)
+  [2] ⚡ Renovar Cuota / Tokens Ampliados (Detección automática de cambio de VPN)
+  [3] 🚀 Modo Tokens Ampliados (Archiva session_v2 inflada + limpia inbox)
   [4] 🧹 Reseteo Rápido Inmediato (Cierra sockets, daemons y limpia DNS/ARP)
   [5] 🧼 Limpieza Profunda Total (Caché + Cookies + Device ID + Sesiones)
-  [6] 📊 Ver Estadísticas de Cuota y Tokens (opencode stats)
-  [7] ❌ Salir
+  [6] 📊 Ver Estadísticas de Cuota y Tokens (sesiones activas, tokens, TOP infladoras)
+  [7] 🌐 Cambiar a OpenRouter Free (Fix: "You've used today's free messages" - Sin límite diario)
+  [8] ❌ Salir
 -------------------------------------------------------------------------------
 ```
 

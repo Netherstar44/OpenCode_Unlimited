@@ -102,27 +102,39 @@ function Show-Banner {
 # NETWORK & IP DETECTION
 # =============================================================================
 
+# =============================================================================
+# NETWORK & IP DETECTION
+# =============================================================================
+
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+    [System.Net.ServicePointManager]::DnsRefreshTimeout = 0
+} catch {}
+
+# Get-PublicIP: Consulta HTTP ultrarrápida (icanhazip.com ~90ms, ipify ~380ms)
+# NO usa nslookup porque VPNs con DNS-Leak-Protection bloquean UDP 53 a resolvers externos
 function Get-PublicIP {
-    param([int]$TimeoutMs = 2500)
+    param([int]$TimeoutMs = 1500)
+
     $endpoints = @(
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-        "https://checkip.amazonaws.com",
-        "https://ipinfo.io/ip",
-        "https://ifconfig.me/ip"
+        'https://icanhazip.com',
+        'https://api.ipify.org',
+        'https://checkip.amazonaws.com',
+        'https://ipinfo.io/ip'
     )
+
     foreach ($url in $endpoints) {
         try {
-            $req = [System.Net.WebRequest]::Create($url)
-            $req.Timeout          = $TimeoutMs
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Timeout = $TimeoutMs
             $req.ReadWriteTimeout = $TimeoutMs
-            $req.KeepAlive        = $false
-            $req.Proxy            = $null
-            $res    = $req.GetResponse()
-            $stream = $res.GetResponseStream()
-            $reader = [System.IO.StreamReader]::new($stream)
-            $ip     = ($reader.ReadToEnd()).Trim()
-            $reader.Close(); $stream.Close(); $res.Close()
+            $req.KeepAlive = $false
+            $req.Proxy = $null
+            $req.UserAgent = 'curl/8.0.0'
+            $res = $req.GetResponse()
+            $reader = [System.IO.StreamReader]::new($res.GetResponseStream())
+            $ip = ($reader.ReadToEnd()).Trim()
+            $reader.Close(); $res.Close()
             if ($ip -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
                 return $ip
             }
@@ -131,36 +143,34 @@ function Get-PublicIP {
     return "Desconocida"
 }
 
-function Get-LocalAdaptersSignature {
-    $signatureItems = @()
+# Get-NetworkSignature: detecta cambios de VPN (UrbanVPN, OpenVPN, Wi-Fi) en 15ms SIN internet
+function Get-NetworkSignature {
     try {
         $adapters = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
-            Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }
-        
-        foreach ($adapter in $adapters) {
-            $ipProps = $adapter.GetIPProperties()
-            $ipv4s = $ipProps.UnicastAddresses |
-                Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and -not $_.Address.ToString().StartsWith('169.254.') } |
-                ForEach-Object { $_.Address.ToString() }
-            
-            $gateways = $ipProps.GatewayAddresses |
-                Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } |
-                ForEach-Object { $_.Address.ToString() }
-
-            $dnsServers = $ipProps.DnsAddresses |
-                Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
-                ForEach-Object { $_.ToString() }
-            
-            if ($ipv4s) {
-                $ips = $ipv4s -join ","
-                $gws = $gateways -join ","
-                $dnss = $dnsServers -join ","
-                $signatureItems += "$($adapter.Name)|$ips|GW:$gws|DNS:$dnss"
+            Where-Object { $_.NetworkInterfaceType -ne 'Loopback' }
+        $parts = @()
+        foreach ($a in $adapters) {
+            if ($a.OperationalStatus -eq 'Up') {
+                $props = $a.GetIPProperties()
+                $ips = $props.UnicastAddresses |
+                       Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and
+                                      -not $_.Address.ToString().StartsWith('169.254.') } |
+                       ForEach-Object { $_.Address.ToString() }
+                $gws = $props.GatewayAddresses |
+                       Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } |
+                       ForEach-Object { $_.Address.ToString() }
+                $dns = $props.DnsAddresses |
+                       Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                       ForEach-Object { $_.ToString() }
+                $parts += "$($a.Name)|UP|IP:$($ips -join ',')|GW:$($gws -join ',')|DNS:$($dns -join ',')"
             }
         }
-    } catch {}
-    return ($signatureItems | Sort-Object) -join " ;; "
+        return ($parts | Sort-Object) -join ';;'
+    } catch { return '' }
 }
+
+function Get-RoutingSignature { return Get-NetworkSignature }
+function Get-LocalAdaptersSignature { return Get-NetworkSignature }
 
 # =============================================================================
 # PROCESSES & DAEMON MANAGEMENT
@@ -521,85 +531,113 @@ function Invoke-FullReset {
 function Invoke-RenewQuotaFlow {
     Show-Banner
 
-    Write-Host "  Detectando IP publica actual..." -ForegroundColor DarkGray
-    $initialIP = Get-PublicIP
+    Write-Host "  Detectando estado de red inicial..." -ForegroundColor DarkGray
+    $initialSig = Get-NetworkSignature
+    $initialIP  = Get-PublicIP
 
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  RENOVAR CUOTA / TOKENS AMPLIADOS" -ForegroundColor Yellow
-    Write-Host "  IP de Salida Actual: $initialIP" -ForegroundColor Cyan
+    Write-Host "  IP Actual: $initialIP" -ForegroundColor Cyan
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  PASOS:" -ForegroundColor White
-    Write-Host "  1. Abre tu app de VPN y cambia de pais / servidor / reconecta." -ForegroundColor White
-    Write-Host "  2. El script detecta la nueva IP y resetea sockets + Device ID automaticamente." -ForegroundColor Gray
+    Write-Host "  1. Abre tu VPN (ej. UrbanVPN) y conecta o cambia de pais/servidor." -ForegroundColor White
+    Write-Host "  2. El monitor detecta la nueva VPN/IP y resetea OpenCode AUTOMATICAMENTE." -ForegroundColor Green
     Write-Host "  3. O presiona ENTER en cualquier momento para forzar la renovacion ya." -ForegroundColor Gray
     Write-Host ""
 
     Send-ToastNotification `
         -Title "Cambiar de VPN ahora" `
-        -Message "OpenCode Unlimited esperando nueva IP. Cambia de país en tu VPN."
+        -Message "OpenCode Unlimited esperando nueva IP. Conecta o cambia de servidor en tu VPN."
 
-    Write-EngineLog "Monitoreo de IP publica iniciado. IP base: $initialIP" "NOTIFY"
+    Write-EngineLog "Esperando cambio de red o IP... (Base: $initialIP)" "NOTIFY"
 
     $attempts      = 0
-    $maxAttempts   = 180
+    $maxAttempts   = 240
     $detectedNewIP = $null
-    $wasOffline    = $false
+    $detectedSigChange = $false
     $lastLine      = ""
 
-    $inputPS = [System.Management.Automation.PowerShell]::Create()
-    $null = $inputPS.AddScript({ try { [Console]::ReadLine() } catch { $null } })
-    $inputHandle = $inputPS.BeginInvoke()
-
     while ($attempts -lt $maxAttempts) {
-        if ($inputHandle.IsCompleted) {
-            Write-Host ""
-            Write-Host "  >> ENTER detectado: forzando renovación con conexión actual..." -ForegroundColor Magenta
-            $detectedNewIP = Get-PublicIP
-            break
+        # Comprobar si el usuario presionó una tecla (no bloqueante)
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq 'Enter' -or $key.Key -eq 'Spacebar') {
+                Write-Host ""
+                Write-Host "  >> ENTER detectado: forzando renovacion con la conexion actual..." -ForegroundColor Magenta
+                $detectedNewIP = Get-PublicIP
+                break
+            }
         }
 
         Start-Sleep -Milliseconds 800
         $attempts++
 
-        $checkIP = Get-PublicIP
+        # Detección instantánea por adaptador/ruteo VPN (0ms)
+        $curSig = Get-NetworkSignature
+        if ($curSig -ne $initialSig) {
+            $detectedSigChange = $true
+            Write-Host ""
+            Write-EngineLog "¡Cambio de adaptador/VPN detectado en tiempo real!" "SUCCESS"
+            Write-Host "  Estabilizando rutas de la nueva conexion ($Debounce s)..." -ForegroundColor Cyan
+            Start-Sleep -Seconds $Debounce
 
-        if ($checkIP -match "Desconocida") {
-            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Transitando VPN... (sin internet - normal durante cambio) [$attempts s]"
-            $statusColor = "DarkYellow"
-            $wasOffline  = $true
-        } elseif ($checkIP -ne $initialIP) {
-            $detectedNewIP = $checkIP
+            # Intentar leer nueva IP
+            for ($k = 0; $k -lt 6; $k++) {
+                $tryIP = Get-PublicIP
+                if ($tryIP -notmatch "Desconocida" -and $tryIP -ne $initialIP) {
+                    $detectedNewIP = $tryIP
+                    break
+                }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $detectedNewIP) {
+                $detectedNewIP = Get-PublicIP
+            }
             break
-        } elseif ($wasOffline) {
-            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Online nuevamente pero misma IP ($checkIP) - cambia de servidor [$attempts s]"
-            $statusColor = "Yellow"
-            $wasOffline  = $false
-        } else {
-            $statusLine  = "  [$(Get-Date -Format 'HH:mm:ss')] Esperando cambio de IP... actual: $checkIP  [$attempts s]"
-            $statusColor = "DarkGray"
         }
 
-        if ($statusLine -ne $lastLine) {
-            Write-Host ("`r" + $statusLine.PadRight(88)) -ForegroundColor $statusColor -NoNewline
-            $lastLine = $statusLine
+        # Detección complementaria por IP pública cada 3 segundos
+        if ($attempts % 3 -eq 0) {
+            $checkIP = Get-PublicIP
+            if ($checkIP -match "Desconocida") {
+                $statusLine = "  [$(Get-Date -Format 'HH:mm:ss')] Negociando VPN... (esperando enlace) [$attempts s]"
+                $statusColor = "DarkYellow"
+            } elseif ($checkIP -ne $initialIP) {
+                $detectedNewIP = $checkIP
+                Write-Host ""
+                Write-EngineLog "¡Nueva IP publica detectada: $checkIP!" "SUCCESS"
+                break
+            } else {
+                $statusLine = "  [$(Get-Date -Format 'HH:mm:ss')] Esperando cambio en VPN... actual: $checkIP [$attempts s]"
+                $statusColor = "DarkGray"
+            }
+
+            if ($statusLine -ne $lastLine) {
+                Write-Host ("`r" + $statusLine.PadRight(88)) -ForegroundColor $statusColor -NoNewline
+                $lastLine = $statusLine
+            }
         }
     }
 
-    try { $inputPS.Stop(); $inputPS.Dispose() } catch {}
     Write-Host ""
 
     if ($detectedNewIP -and $detectedNewIP -notmatch "Desconocida") {
         Write-Host ""
-        Write-Host "  Nueva IP detectada: $detectedNewIP" -ForegroundColor Green
-        Write-Host "  Estabilizando rutas ($Debounce s) y aplicando Tokens Ampliados..." -ForegroundColor Cyan
-        Start-Sleep -Seconds $Debounce
+        Write-Host "  Nueva IP confirmada: $detectedNewIP" -ForegroundColor Green
+        Write-Host "  Aplicando Tokens Ampliados y rotando identidad..." -ForegroundColor Cyan
         Invoke-FullReset -ForceCleanSession -NewIP $detectedNewIP
-        Write-EngineLog "Cuota renovada con éxito. Nueva IP activa: $detectedNewIP" "SUCCESS"
+        Write-EngineLog "Cuota renovada con exito. Nueva IP activa: $detectedNewIP" "SUCCESS"
+    } elseif ($detectedSigChange) {
+        Write-Host ""
+        Write-Host "  Red cambiada exitosamente. Aplicando reseteo completo..." -ForegroundColor Green
+        $confirmedIP = Get-PublicIP
+        Invoke-FullReset -ForceCleanSession -NewIP $confirmedIP
+        Write-EngineLog "Cuota renovada con exito. IP activa: $confirmedIP" "SUCCESS"
     } else {
         Write-Host ""
-        Write-Host "  No se detecto cambio de IP." -ForegroundColor Yellow
-        Write-Host "  Deseas forzar el reseteo con Tokens Ampliados en la IP actual? (S/N): " -NoNewline -ForegroundColor White
+        Write-Host "  No se detecto cambio automatico de red/IP." -ForegroundColor Yellow
+        Write-Host "  Deseas forzar el reseteo con Tokens Ampliados ahora? (S/N): " -NoNewline -ForegroundColor White
         $resp = Read-Host
         if ($resp -match "^[sSyY]") {
             Invoke-FullReset -ForceCleanSession
@@ -607,92 +645,117 @@ function Invoke-RenewQuotaFlow {
     }
 }
 
+function Switch-ToOpenRouterFreeModel {
+    param([switch]$Silent)
+    # Cambia el modelo activo de OpenCode al proveedor OpenRouter (sin limite diario de mensajes)
+    # Esto resuelve el error "You've used today's free messages"
+    $modelJsonPath = "$env:USERPROFILE\.local\state\opencode\model.json"
+    $freeModels = @(
+        @{ providerID = 'openrouter'; modelID = 'nvidia/nemotron-3.5-lightning:free' },
+        @{ providerID = 'openrouter'; modelID = 'nvidia/nemotron-3.5-super-vl:free' },
+        @{ providerID = 'openrouter'; modelID = 'deepseek/deepseek-chat-v3-0324:free' },
+        @{ providerID = 'openrouter'; modelID = 'minimax/minimax-m3.1-flash:free' }
+    )
+    try {
+        $content = Get-Content -LiteralPath $modelJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $existing = @($content.recent)
+        $newRecent = $freeModels + $existing | Select-Object -First 12
+        $content.recent = $newRecent
+        $content | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $modelJsonPath -Encoding UTF8 -Force
+
+        # Actualizar tambien las sesiones activas en session_v2 que usaban el proveedor opencode
+        $dbPath = "$env:USERPROFILE\.local\share\opencode\opencode.db"
+        if (Test-Path $dbPath) {
+            $pyScript = @"
+import sqlite3, os
+db = os.path.expanduser(r'~/.local/share/opencode/opencode.db')
+conn = sqlite3.connect(db)
+cur = conn.cursor()
+new_model = '{"id":"nvidia/nemotron-3.5-lightning:free","providerID":"openrouter","variant":"balanced"}'
+cur.execute("UPDATE session_v2 SET model = ? WHERE model LIKE '%opencode%'", (new_model,))
+conn.commit()
+conn.close()
+"@
+            python -c $pyScript 2>$null
+        }
+
+        if (-not $Silent) {
+            Write-EngineLog "Modelo cambiado a OpenRouter free (sin limite diario). Reinicia OpenCode y usa 'nemotron-3.5-lightning:free'." "SUCCESS"
+            Send-ToastNotification -Title "Modelo cambiado a OpenRouter" -Message "Sin limite diario de mensajes. Reinicia OpenCode y disfruta de 1M contexto."
+        }
+    } catch {
+        Write-EngineLog "No se pudo cambiar model.json: $($_.Exception.Message)" "WARN"
+    }
+}
+
 function Invoke-WatchLoop {
     Show-Banner
-    Write-Host "  MODO MONITOR ACTIVO (Tokens Ampliados 24/7)" -ForegroundColor Green
-    Write-Host "  Vigilando cambios de VPN, IP publica y adaptadores de red..." -ForegroundColor White
-    Write-Host "  Presiona Ctrl + C en cualquier momento para detener el monitor." -ForegroundColor DarkGray
+    Write-Host "  MODO MONITOR ACTIVO - Deteccion en Tiempo Real de VPN y Red" -ForegroundColor Green
+    Write-Host "  Vigilando cambios de adaptadores/VPN cada $Interval segundos." -ForegroundColor White
+    Write-Host "  Presiona Ctrl+C para detener." -ForegroundColor DarkGray
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
 
     $PID | Set-Content -Path $global:PidFile -Force -ErrorAction SilentlyContinue
 
-    $lastLocalSig  = Get-LocalAdaptersSignature
-    $lastPublicIP  = Get-PublicIP -TimeoutMs 3000
-    $publicIPFails = 0   # contador de fallos consecutivos al obtener IP publica
-    $ticksSincePublicCheck = 0
+    Write-Host "  Obteniendo estado inicial de red..." -ForegroundColor DarkGray
+    $lastSig      = Get-NetworkSignature
+    $lastPublicIP = Get-PublicIP
 
-    Write-EngineLog "Monitor iniciado. IP Publica Inicial: $lastPublicIP" "SUCCESS"
+    Write-EngineLog "Monitor iniciado. Firma: [$lastSig]" "SUCCESS"
+    Write-EngineLog "IP Publica inicial: $lastPublicIP" "SUCCESS"
+    Write-Host "  IP actual: $lastPublicIP" -ForegroundColor Cyan
+    Write-Host ""
 
-    $ticks = 0
+    $tickCount = 0
     while ($true) {
         try {
             Start-Sleep -Seconds $Interval
-            $ticks++
-            $ticksSincePublicCheck++
+            $tickCount++
 
-            # --- Detectar cambio en adaptadores locales (siempre rapido) ---
-            $currentLocalSig = Get-LocalAdaptersSignature
-            $localChanged    = ($currentLocalSig -ne $lastLocalSig)
+            # 1. Comprobación local instantánea (15ms, 0ms internet)
+            $curSig = Get-NetworkSignature
+            $sigChanged = ($curSig -ne $lastSig)
 
-            # --- Verificar IP publica: SIEMPRE en cada tick para no perder cambios rapidos ---
-            $currentPublicIP = Get-PublicIP -TimeoutMs 2500
-            $ticksSincePublicCheck = 0
+            # 2. Comprobación de IP pública (si la firma cambió o cada 15 segundos)
+            $curPublicIP = $lastPublicIP
+            $ipChanged   = $false
 
-            $publicChanged = $false
-            if ($currentPublicIP -notmatch "Desconocida") {
-                $publicIPFails = 0
-                if ($currentPublicIP -ne $lastPublicIP) {
-                    $publicChanged = $true
-                }
-            } else {
-                $publicIPFails++
-                # Si llevamos 3+ intentos sin internet, es transicion de VPN -> esperar y re-chequear
-                if ($publicIPFails -ge 3 -and $localChanged) {
-                    Write-EngineLog "Sin internet por $publicIPFails ciclos consecutivos + cambio local detectado. Esperando reconexion VPN..." "WARN"
-                    # Esperar hasta 30s a que la VPN se establezca
-                    $waitCycles = 0
-                    while ($waitCycles -lt 10) {
-                        Start-Sleep -Seconds 3
-                        $waitCycles++
-                        $tryIP = Get-PublicIP -TimeoutMs 3000
-                        if ($tryIP -notmatch "Desconocida") {
-                            $currentPublicIP = $tryIP
-                            $publicChanged   = ($tryIP -ne $lastPublicIP)
-                            $publicIPFails   = 0
-                            Write-EngineLog "VPN reconnected. Nueva IP: $tryIP" "SUCCESS"
-                            break
-                        }
+            if ($sigChanged -or ($tickCount % 5 -eq 0)) {
+                $checkIP = Get-PublicIP
+                if ($checkIP -notmatch 'Desconocida') {
+                    if ($checkIP -ne $lastPublicIP) {
+                        $ipChanged   = $true
+                        $curPublicIP = $checkIP
                     }
                 }
             }
 
-            if ($localChanged -or $publicChanged) {
-                Write-EngineLog "Cambio de Red / VPN detectado!" "WARN"
-                if ($publicChanged) {
-                    Write-EngineLog "IP Publica: $lastPublicIP -> $currentPublicIP" "ACTION"
-                } elseif ($localChanged) {
-                    Write-EngineLog "Cambio de adaptador local detectado (IP publica sin cambio verificado aun)." "ACTION"
-                }
+            if ($sigChanged -or $ipChanged) {
+                $changeDetails = @()
+                if ($sigChanged) { $changeDetails += "ADAPTADOR/VPN" }
+                if ($ipChanged)  { $changeDetails += "IP($lastPublicIP->$curPublicIP)" }
+                $changeDesc = $changeDetails -join " + "
 
-                Send-ToastNotification `
-                    -Title "Cambio de VPN Detectado" `
-                    -Message "Estabilizando conexion y aplicando Tokens Ampliados a OpenCode..."
+                Write-EngineLog "¡Cambio de Red / VPN detectado! [$changeDesc]" "WARN"
+                Send-ToastNotification -Title "VPN Cambiada - Reseteando" -Message "Detectado: $changeDesc. Estabilizando y aplicando Tokens Ampliados..."
 
-                Write-EngineLog "Esperando $Debounce segundos a que la VPN termine de negociar rutas..." "WARN"
+                Write-EngineLog "Esperando $Debounce segundos a que la nueva conexion se estabilice..." "WARN"
                 Start-Sleep -Seconds $Debounce
 
-                # Actualizar firmas DESPUES del debounce (estado estabilizado)
-                $lastLocalSig = Get-LocalAdaptersSignature
-                $confirmedIP  = Get-PublicIP -TimeoutMs 3000
-                if ($confirmedIP -notmatch "Desconocida") { $lastPublicIP = $confirmedIP }
+                # Confirmar IP post-estabilización
+                $confirmedIP = Get-PublicIP
+                if ($confirmedIP -notmatch 'Desconocida') {
+                    $lastPublicIP = $confirmedIP
+                }
+                $lastSig = Get-NetworkSignature
 
                 Invoke-FullReset -NewIP $lastPublicIP
-                Write-EngineLog "Monitoreo reanudado. IP activa: $lastPublicIP" "SUCCESS"
+                Write-Host "  IP activa post-reset: $lastPublicIP" -ForegroundColor Cyan
                 Write-Host ""
             }
         } catch {
-            Write-EngineLog "Error transitorio en monitor: $($_.Exception.Message)" "WARN"
-            Start-Sleep -Seconds 5
+            Write-EngineLog "Error en ciclo monitor: $($_.Exception.Message)" "WARN"
+            Start-Sleep -Seconds 4
         }
     }
 }
@@ -705,18 +768,19 @@ function Show-InteractiveMenu {
     while ($true) {
         Show-Banner
         Write-Host "  Obteniendo IP publica..." -ForegroundColor DarkGray
-        $currentIP = Get-PublicIP -TimeoutMs 3000
+        $currentIP = Get-PublicIP
         Write-Host "  IP Publica Actual: $currentIP" -ForegroundColor Yellow
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  [1]  Monitor Automatico (detecta VPN/IP cada 3s y resetea tokens 24/7)" -ForegroundColor White
-        Write-Host "  [2]  Renovar Cuota     (espera nueva IP + rota Device ID)" -ForegroundColor White
-        Write-Host "  [3]  Tokens Ampliados  (archiva contexto inflado de session_v2 + optimiza)" -ForegroundColor Cyan
-        Write-Host "  [4]  Reseteo Rapido    (cierra sockets/daemons, limpia DNS/ARP/NetBIOS)" -ForegroundColor White
-        Write-Host "  [5]  Limpieza Total    (cache + cookies + Device ID + sesiones)" -ForegroundColor White
-        Write-Host "  [6]  Stats de Tokens   (sesiones activas, tokens acumulados, TOP infladoras)" -ForegroundColor Green
-        Write-Host "  [7]  Salir" -ForegroundColor Gray
+        Write-Host "  [1]  Monitor Automatico  (ruteo+IP cada 3s, reset automatico 24/7)" -ForegroundColor White
+        Write-Host "  [2]  Renovar Cuota       (espera nueva IP + rota Device ID)" -ForegroundColor White
+        Write-Host "  [3]  Tokens Ampliados    (archiva session_v2 + limpia inbox)" -ForegroundColor Cyan
+        Write-Host "  [4]  Reseteo Rapido      (sockets, daemons, DNS/ARP/NetBIOS)" -ForegroundColor White
+        Write-Host "  [5]  Limpieza Total      (cache + cookies + Device ID + sesiones)" -ForegroundColor White
+        Write-Host "  [6]  Stats de Tokens     (sesiones activas, tokens, TOP infladoras)" -ForegroundColor Green
+        Write-Host "  [7]  Cambiar a OpenRouter (fix: 'You've used today's free messages')" -ForegroundColor Yellow
+        Write-Host "  [8]  Salir" -ForegroundColor Gray
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
-        Write-Host "  Selecciona una opcion [1-7]: " -NoNewline -ForegroundColor Cyan
+        Write-Host "  Selecciona una opcion [1-8]: " -NoNewline -ForegroundColor Cyan
         
         $choice = Read-Host
 
@@ -772,6 +836,23 @@ function Show-InteractiveMenu {
                 [Console]::ReadKey($true) | Out-Null
             }
             "7" {
+                Show-Banner
+                Write-Host "  CAMBIAR A OPENROUTER FREE (sin limite diario)" -ForegroundColor Yellow
+                Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
+                Write-Host "  El error 'You ve used today s free messages' ocurre cuando el proveedor" -ForegroundColor Gray
+                Write-Host "  opencode agota su cuota diaria. OpenRouter tiene modelos gratis sin ese limite." -ForegroundColor Gray
+                Write-Host ""
+                Switch-ToOpenRouterFreeModel
+                Write-Host ""
+                Write-Host "  Hecho! En OpenCode selecciona uno de estos modelos:" -ForegroundColor Green
+                Write-Host "  - nvidia/nemotron-3.5-lightning:free  (1M contexto)" -ForegroundColor Cyan
+                Write-Host "  - nvidia/nemotron-3.5-super-vl:free   (1M contexto)" -ForegroundColor Cyan
+                Write-Host "  - deepseek/deepseek-chat-v3-0324:free" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "Presiona cualquier tecla para volver al menu..." -ForegroundColor Gray
+                [Console]::ReadKey($true) | Out-Null
+            }
+            "8" {
                 Write-Host "Saliendo... Hasta pronto!" -ForegroundColor Cyan
                 return
             }
@@ -788,20 +869,22 @@ function Show-InteractiveMenu {
 # =============================================================================
 
 switch ($Action.ToLower()) {
-    "watch"    { Invoke-WatchLoop }
-    "-w"       { Invoke-WatchLoop }
-    "--watch"  { Invoke-WatchLoop }
-    "renew"    { Invoke-RenewQuotaFlow }
-    "-r"       { Invoke-RenewQuotaFlow }
-    "--renew"  { Invoke-RenewQuotaFlow }
-    "boost"    { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
-    "--boost"  { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
-    "stats"    { Show-TokenStats }
-    "--stats"  { Show-TokenStats }
-    "-s"       { Show-TokenStats }
-    "reset"    { Invoke-FullReset }
-    "--reset"  { Invoke-FullReset }
-    "clean"    { Invoke-FullReset -ForceCleanSession }
-    "--clean"  { Invoke-FullReset -ForceCleanSession }
-    Default    { Show-InteractiveMenu }
+    "watch"         { Invoke-WatchLoop }
+    "-w"            { Invoke-WatchLoop }
+    "--watch"       { Invoke-WatchLoop }
+    "renew"         { Invoke-RenewQuotaFlow }
+    "-r"            { Invoke-RenewQuotaFlow }
+    "--renew"       { Invoke-RenewQuotaFlow }
+    "boost"         { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
+    "--boost"       { Optimize-OpenCodeSessions -ForceArchiveAll; Optimize-TokenConsumptionProfile -Profile "balanced" }
+    "stats"         { Show-TokenStats }
+    "--stats"       { Show-TokenStats }
+    "-s"            { Show-TokenStats }
+    "switch-model"  { Switch-ToOpenRouterFreeModel }
+    "--switch"      { Switch-ToOpenRouterFreeModel }
+    "reset"         { Invoke-FullReset }
+    "--reset"       { Invoke-FullReset }
+    "clean"         { Invoke-FullReset -ForceCleanSession }
+    "--clean"       { Invoke-FullReset -ForceCleanSession }
+    Default         { Show-InteractiveMenu }
 }

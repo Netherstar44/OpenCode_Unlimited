@@ -5,6 +5,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 currentDir = fso.GetParentFolderName(WScript.ScriptFullName)
 psScript = currentDir & "\Watch-NetworkChanges.ps1"
 
+Set WshShell = CreateObject("WScript.Shell")
 cmd = "cmd.exe /c """"" & currentDir & "\OpenCodeUnlimited.bat"""" --watch -Silent"
 WshShell.Run cmd, 0, False
 

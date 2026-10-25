@@ -148,9 +148,9 @@ try {
 try {
     $dbPath = "$env:USERPROFILE\.local\share\opencode\opencode.db"
     if (Test-Path $dbPath) {
-        $pyCode = "import sqlite3, os, time; conn=sqlite3.connect(r'$dbPath'); cur=conn.cursor(); cur.execute('UPDATE session SET time_archived = ? WHERE time_archived IS NULL', (int(time.time()*1000),)); conn.commit(); conn.close()"
+        $pyCode = "import sqlite3, os, time; conn=sqlite3.connect(r'$dbPath'); cur=conn.cursor(); ts=int(time.time()*1000); cur.execute('UPDATE session_v2 SET time_archived = ? WHERE time_archived IS NULL', (ts,)); cur.execute('UPDATE session SET time_archived = ? WHERE time_archived IS NULL', (ts,)); cur.execute('DELETE FROM session_inbox'); conn.commit(); conn.close()"
         python -c $pyCode 2>$null
-        Write-Log "Sesiones infladas archivadas: contexto limpio activado." "SUCCESS"
+        Write-Log "Sesiones infladas archivadas (session_v2 + inbox limpio): contexto 0 activado." "SUCCESS"
     }
 } catch {}
 
