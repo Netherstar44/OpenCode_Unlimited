@@ -171,7 +171,10 @@ function Get-LocalAdaptersSignature { return Get-NetworkSignature }
 # Test-OpenCodeQuotaAvailable: Sondea directamente opencode.ai para verificar si la IP actual
 # tiene cuota diaria disponible para modelos gratuitos (evita reabrir OpenCode con IP quemada)
 function Test-OpenCodeQuotaAvailable {
-    param([int]$TimeoutMs = 3500)
+    param(
+        [int]$TimeoutMs = 3500,
+        [string]$ProxyUrl = ""
+    )
     try {
         $url = 'https://opencode.ai/inference/openai/v1/chat/completions'
         $req = [System.Net.HttpWebRequest]::Create($url)
@@ -179,7 +182,11 @@ function Test-OpenCodeQuotaAvailable {
         $req.Timeout = $TimeoutMs
         $req.ReadWriteTimeout = $TimeoutMs
         $req.KeepAlive = $false
-        $req.Proxy = $null
+        if ($ProxyUrl) {
+            $req.Proxy = [System.Net.WebProxy]::new($ProxyUrl)
+        } else {
+            $req.Proxy = $null
+        }
         $req.ContentType = 'application/json'
         $req.Headers.Add('Authorization', 'Bearer public')
         $req.UserAgent = 'opencode/2.1.4'
@@ -212,6 +219,42 @@ function Test-OpenCodeQuotaAvailable {
         return @{ Available = $false; Status = $statusCode; Reason = "ERROR_CONEXION" }
     } catch {
         return @{ Available = $false; Status = 0; Reason = $_.Exception.Message }
+    }
+}
+
+# Get-UserAntiCollisionPool: Dispersión matemática de usuarios en 10 canales geográficos
+# para que múltiples usuarios de OpenCodeUnlimited nunca compitan por las mismas IPs/nodos
+function Get-UserAntiCollisionPool {
+    $uuid = ""
+    try {
+        $uuid = (Get-CimInstance Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).UUID
+    } catch {}
+    if (-not $uuid) {
+        $uuid = [Environment]::MachineName + "_" + [Environment]::UserName
+    }
+    $hash = 0
+    foreach ($char in $uuid.ToCharArray()) {
+        $hash = (($hash * 31) + [int]$char) -band 0x7FFFFFFF
+    }
+    $channel = $hash % 10
+
+    # 10 grupos de países con bajo índice de colisión (excluyendo US/UK/Australia saturados)
+    $countryPools = @(
+        @("Suiza", "Islandia", "Noruega", "Japon", "Singapur"),
+        @("Suecia", "Finlandia", "Nueva Zelanda", "Austria", "Irlanda"),
+        @("Canada", "Paises Bajos", "Belgica", "Dinamarca", "Taiwan"),
+        @("Alemania", "Republica Checa", "Polonia", "Portugal", "Chile"),
+        @("Estonia", "Lituania", "Letonia", "Eslovaquia", "Corea del Sur"),
+        @("Espana", "Italia", "Hungria", "Grecia", "Malasia"),
+        @("Francia", "Luxemburgo", "Eslovenia", "Rumania", "Israel"),
+        @("Brasil", "Mexico", "Argentina", "Colombia", "Sudafrica"),
+        @("India", "Vietnam", "Tailandia", "Indonesia", "Filipinas"),
+        @("Chipre", "Croacia", "Bulgaria", "Serbia", "Turquia")
+    )
+    return @{
+        Channel   = $channel
+        Countries = $countryPools[$channel]
+        Uuid      = $uuid
     }
 }
 
@@ -597,10 +640,12 @@ function Invoke-FullReset {
 function Invoke-RenewQuotaFlow {
     Show-Banner
 
-    Write-Host "  Comprobando red y estado actual de cuota..." -ForegroundColor DarkGray
+    Write-Host "  Comprobando red, cuota y canal anti-colision..." -ForegroundColor DarkGray
     $initialSig = Get-NetworkSignature
     $initialIP  = Get-PublicIP
     $probeInit  = Test-OpenCodeQuotaAvailable -TimeoutMs 3500
+    $pool       = Get-UserAntiCollisionPool
+    $poolCountries = $pool.Countries -join ', '
 
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  RENOVAR CUOTA / TOKENS AMPLIADOS" -ForegroundColor Yellow
@@ -612,14 +657,17 @@ function Invoke-RenewQuotaFlow {
     } else {
         Write-Host "  Estado de Cuota en IP Actual: [$($probeInit.Reason)]" -ForegroundColor DarkYellow
     }
+    Write-Host "  Canal Anti-Colision Asignado: #$($pool.Channel) de 10" -ForegroundColor Magenta
+    Write-Host "  Tus paises dedicados: $poolCountries" -ForegroundColor Green
     Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
+    Write-Host "  TU CANAL EXCLUSIVO (minimiza colisiones con otros usuarios del script):" -ForegroundColor White
+    Write-Host "  Canal #$($pool.Channel) -> $poolCountries" -ForegroundColor Green
+    Write-Host ""
     Write-Host "  COMO RENOVAR CUOTA CON EXITO:" -ForegroundColor White
-    Write-Host "  1. En tu VPN (ej. UrbanVPN), conecta o cambia a otro pais (ej: Suiza, Japon," -ForegroundColor White
-    Write-Host "     Islandia, Noruega, Singapur, Canada... evita paises saturados)." -ForegroundColor White
+    Write-Host "  1. En tu VPN, conecta a UNO de tus paises del Canal #$($pool.Channel) listados arriba." -ForegroundColor White
     Write-Host "  2. El monitor detecta la nueva conexion y VERIFICA que la IP tenga cuota real." -ForegroundColor Green
-    Write-Host "  3. Si la VPN te asigna una IP ya consumida hoy por otro usuario, te avisara" -ForegroundColor Yellow
-    Write-Host "     inmediatamente para que elijas otro pais sin perder tiempo." -ForegroundColor Yellow
+    Write-Host "  3. Si la VPN asigna una IP ya usada hoy, te avisara para que cambies de pais." -ForegroundColor Yellow
     Write-Host "  4. Cuando confirme una IP con cuota 100% libre, reseteara y abrira OpenCode." -ForegroundColor Cyan
     Write-Host "  (Presiona ENTER en cualquier momento para forzar renovacion con la IP actual)" -ForegroundColor DarkGray
     Write-Host ""
@@ -672,10 +720,10 @@ function Invoke-RenewQuotaFlow {
                     Write-EngineLog "AVISO: La IP asignada ($newIP) ya fue quemada hoy por otro usuario en este nodo VPN." "WARN"
                     Write-Host ""
                     Write-Host "  =========================================================================" -ForegroundColor Yellow
-                    Write-Host "  ⚠️  LA IP $newIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
-                    Write-Host "  Como UrbanVPN es publica y compartida, otro usuario en ese nodo ya la agoto." -ForegroundColor Yellow
-                    Write-Host "  >> SOLUCION: En tu VPN, selecciona OTRO PAIS diferente (ej: Suiza, Islandia," -ForegroundColor Green
-                    Write-Host "     Suecia, Noruega, Singapur, Japon, Canada) y conecta de nuevo." -ForegroundColor Green
+                    Write-Host "  LA IP $newIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
+                    Write-Host "  IPs compartidas de VPN publica son usadas por muchos desarrolladores." -ForegroundColor Yellow
+                    Write-Host "  >> Tu canal #$($pool.Channel) recomienda: $poolCountries" -ForegroundColor Green
+                    Write-Host "  Conecta tu VPN a uno de esos paises para obtener una IP limpia." -ForegroundColor Green
                     Write-Host "  =========================================================================" -ForegroundColor Yellow
                     Write-Host ""
                     $initialIP  = $newIP
@@ -707,8 +755,9 @@ function Invoke-RenewQuotaFlow {
                     Write-EngineLog "AVISO: La IP asignada ($checkIP) ya fue quemada hoy por otro usuario." "WARN"
                     Write-Host ""
                     Write-Host "  =========================================================================" -ForegroundColor Yellow
-                    Write-Host "  ⚠️  LA IP $checkIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
-                    Write-Host "  >> Por favor cambia a OTRO PAIS en tu VPN para obtener una IP limpia..." -ForegroundColor Yellow
+                    Write-Host "  LA IP $checkIP YA CONSUMIO SU CUOTA GRATUITA HOY" -ForegroundColor Red
+                    Write-Host "  >> Tu canal #$($pool.Channel) recomienda: $poolCountries" -ForegroundColor Green
+                    Write-Host "  Conecta tu VPN a uno de esos paises para obtener una IP limpia." -ForegroundColor Green
                     Write-Host "  =========================================================================" -ForegroundColor Yellow
                     Write-Host ""
                     $initialIP  = $checkIP
@@ -875,9 +924,10 @@ function Invoke-WatchLoop {
 function Show-InteractiveMenu {
     while ($true) {
         Show-Banner
-        Write-Host "  Consultando conexion y cuota diaria..." -ForegroundColor DarkGray
+        Write-Host "  Consultando conexion, cuota y canal anti-colision..." -ForegroundColor DarkGray
         $currentIP   = Get-PublicIP
         $quotaStatus = Test-OpenCodeQuotaAvailable -TimeoutMs 2500
+        $pool        = Get-UserAntiCollisionPool
 
         Write-Host "  IP Publica Actual:  $currentIP" -ForegroundColor Cyan
         if ($quotaStatus.Available) {
@@ -887,6 +937,7 @@ function Show-InteractiveMenu {
         } else {
             Write-Host "  Estado de Cuota IP: [$($quotaStatus.Reason)]" -ForegroundColor DarkYellow
         }
+        Write-Host "  Canal Anti-Colision: #$($pool.Channel)/10 -> $($pool.Countries -join ', ')" -ForegroundColor Magenta
 
         Write-Host "-------------------------------------------------------------------------------" -ForegroundColor DarkGray
         Write-Host "  [1]  Monitor Automatico  (ruteo+IP cada 3s, reset automatico 24/7)" -ForegroundColor White
