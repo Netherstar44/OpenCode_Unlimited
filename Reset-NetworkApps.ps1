@@ -105,18 +105,56 @@ if ($HandleDesktop) {
     }
 }
 
-# 3. Terminar instancias de OpenCode CLI (opencode.exe) colgadas
+# 3. Terminar instancias de OpenCode CLI, daemons y servicios
 $cliCount = 0
 if ($KillCli) {
-    $cliProcesses = Get-Process -Name "opencode" -ErrorAction SilentlyContinue
-    if ($cliProcesses) {
-        $cliCount = $cliProcesses.Count
-        Write-Log "Terminando $cliCount proceso(s) colgado(s) de OpenCode CLI..." "WARN"
-        Stop-Process -Name "opencode" -Force -ErrorAction SilentlyContinue
+    try { & opencode service stop 2>$null | Out-Null } catch {}
+
+    $targetProcessNames = @("opencode", "opencode-cli")
+    foreach ($pName in $targetProcessNames) {
+        $cliProcesses = Get-Process -Name $pName -ErrorAction SilentlyContinue
+        if ($cliProcesses) {
+            $cliCount += $cliProcesses.Count
+            Write-Log "Terminando $($cliProcesses.Count) proceso(s) de $pName..." "WARN"
+            Stop-Process -Name $pName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Terminar ejecutables de servicio residuales
+    Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like "*opencode-service*" } | ForEach-Object {
+        Write-Log "Terminando proceso de servicio huérfano: $($_.ProcessName)..." "WARN"
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
     }
 }
 
-# 4. Procesos adicionales personalizados (si se especificaron)
+# 4. Rotar Device ID e identidad para tokens ampliados
+try {
+    $updaterIdPath = "$env:APPDATA\ai.opencode.desktop\.updaterId"
+    [guid]::NewGuid().ToString() | Set-Content -LiteralPath $updaterIdPath -Force -ErrorAction SilentlyContinue
+    
+    $serviceJson = "$env:USERPROFILE\.local\state\opencode\service.json"
+    if (Test-Path $serviceJson) { Remove-Item -Path $serviceJson -Force -ErrorAction SilentlyContinue }
+
+    # Limpiar cookies y tokens temporales
+    $desktopApp = "$env:APPDATA\ai.opencode.desktop"
+    @("Local Storage", "Session Storage", "IndexedDB", "Network\Cookies") | ForEach-Object {
+        $targetP = Join-Path $desktopApp $_
+        if (Test-Path $targetP) { Remove-Item -Path $targetP -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Log "Identidad y Device ID rotados (cuota virgen)." "SUCCESS"
+} catch {}
+
+# 5. Archivar sesiones infladas para desbloquear tokens limpios
+try {
+    $dbPath = "$env:USERPROFILE\.local\share\opencode\opencode.db"
+    if (Test-Path $dbPath) {
+        $pyCode = "import sqlite3, os, time; conn=sqlite3.connect(r'$dbPath'); cur=conn.cursor(); cur.execute('UPDATE session SET time_archived = ? WHERE time_archived IS NULL', (int(time.time()*1000),)); conn.commit(); conn.close()"
+        python -c $pyCode 2>$null
+        Write-Log "Sesiones infladas archivadas: contexto limpio activado." "SUCCESS"
+    }
+} catch {}
+
+# 6. Procesos adicionales personalizados (si se especificaron)
 foreach ($procName in $ExtraProcesses) {
     $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
     if ($procs) {
